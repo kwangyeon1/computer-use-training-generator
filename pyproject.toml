@@ -1,0 +1,20 @@
+[build-system]
+requires = ["setuptools>=68"]
+build-backend = "setuptools.build_meta"
+
+[project]
+name = "computer-use-training-generator"
+version = "0.1.0"
+description = "Training-data generator for qwen-computer-use-agent raw Python runs."
+readme = "README.md"
+requires-python = ">=3.11"
+dependencies = []
+
+[project.optional-dependencies]
+dev = ["pytest>=8.0"]
+
+[project.scripts]
+training-generator = "computer_use_training_generator.cli:main"
+
+[tool.setuptools.packages.find]
+where = ["src"]
