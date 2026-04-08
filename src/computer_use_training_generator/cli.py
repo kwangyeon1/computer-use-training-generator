@@ -9,9 +9,17 @@ import subprocess
 import sys
 
 from .agent import bootstrap_agent, run_agent_prompt
-from .collector import collect_run_artifacts
+from .collector import (
+    append_run_artifacts,
+    collect_run_artifacts,
+    prepare_session_root,
+    write_agent_invocation_payload,
+    write_session_manifest,
+    write_teacher_bundle,
+)
 from .config_utils import load_generator_config
-from .teacher import run_teacher
+from .models import TeacherChunkPlanResult, TeacherTaskChunk
+from .teacher import run_teacher, split_teacher_response
 
 
 def _find_existing_path(candidates: list[Path]) -> Path | None:
@@ -67,6 +75,7 @@ def _build_effective_config(args: argparse.Namespace) -> tuple[dict, Path | None
     _override(config, "teacher_command_template", getattr(args, "teacher_command_template", None))
     _override(config, "teacher_timeout_s", getattr(args, "teacher_timeout_s", None))
     _override(config, "teacher_workdir", getattr(args, "teacher_workdir", None))
+    _override(config, "teacher_split_timeout_s", getattr(args, "teacher_split_timeout_s", None))
     _override(config, "agent_command", getattr(args, "agent_command", None))
     _override(config, "agent_model_id", getattr(args, "agent_model_id", None))
     _override(config, "agent_config_path", getattr(args, "agent_config_path", None))
@@ -74,6 +83,8 @@ def _build_effective_config(args: argparse.Namespace) -> tuple[dict, Path | None
     _override(config, "agent_workdir", getattr(args, "agent_workdir", None))
     _override(config, "agent_bootstrap_timeout_s", getattr(args, "agent_bootstrap_timeout_s", None))
     _override(config, "agent_prompt_timeout_s", getattr(args, "agent_prompt_timeout_s", None))
+    if getattr(args, "teacher_split_enabled", False):
+        config["teacher_split_enabled"] = True
     if getattr(args, "agent_reasoning_enabled", False):
         config["agent_reasoning_enabled"] = True
     if getattr(args, "output_dir", None) is not None:
@@ -210,6 +221,61 @@ def cmd_run_session(args: argparse.Namespace) -> int:
         timeout_s=float(config.get("teacher_timeout_s", 300)),
     )
 
+    teacher_split_enabled = bool(config.get("teacher_split_enabled", True))
+    if teacher_split_enabled:
+        teacher_plan = split_teacher_response(
+            task=args.task,
+            teacher_text=teacher_result.response_text,
+            command_template=str(config.get("teacher_command_template", "")),
+            cwd=config.get("teacher_workdir"),
+            timeout_s=float(config.get("teacher_split_timeout_s", config.get("teacher_timeout_s", 300))),
+        )
+    else:
+        teacher_plan = TeacherChunkPlanResult(
+            source_task=args.task,
+            source_text=teacher_result.response_text,
+            chunks=[
+                TeacherTaskChunk(
+                    chunk_id="chunk-001",
+                    title=args.task,
+                    agent_prompt=teacher_result.response_text,
+                    success_hint=None,
+                    notes=["teacher_split_disabled"],
+                )
+            ],
+            command_result=teacher_result.command_result,
+        )
+
+    session_id, session_root = prepare_session_root(output_dir=str(config["output_dir"]), task=args.task)
+    write_teacher_bundle(
+        session_root=session_root,
+        teacher_prompt=teacher_prompt,
+        teacher_text=teacher_result.response_text,
+        teacher_result=teacher_result,
+        teacher_plan_payload={
+            "source_task": teacher_plan.source_task,
+            "source_text": teacher_plan.source_text,
+            "chunks": [
+                {
+                    "chunk_id": chunk.chunk_id,
+                    "title": chunk.title,
+                    "agent_prompt": chunk.agent_prompt,
+                    "success_hint": chunk.success_hint,
+                    "notes": list(chunk.notes),
+                }
+                for chunk in teacher_plan.chunks
+            ],
+            "command_result": {
+                "command": list(teacher_plan.command_result.command),
+                "cwd": teacher_plan.command_result.cwd,
+                "returncode": teacher_plan.command_result.returncode,
+                "stdout": teacher_plan.command_result.stdout,
+                "stderr": teacher_plan.command_result.stderr,
+                "duration_s": teacher_plan.command_result.duration_s,
+            },
+        },
+    )
+
     bootstrap_result = None
     agent_model_id = config.get("agent_model_id")
     if not args.skip_bootstrap:
@@ -224,29 +290,68 @@ def cmd_run_session(args: argparse.Namespace) -> int:
             cwd=config.get("agent_workdir"),
             timeout_s=float(config.get("agent_bootstrap_timeout_s", 600)),
         )
+        write_agent_invocation_payload(
+            session_root=session_root,
+            name="agent_bootstrap.json",
+            invocation=bootstrap_result,
+        )
 
-    prompt_result = run_agent_prompt(
-        agent_command=str(config["agent_command"]),
-        prompt=teacher_result.response_text,
-        endpoint=config.get("agent_endpoint"),
-        config_path=config.get("agent_config_path"),
-        reasoning_enabled=bool(config.get("agent_reasoning_enabled", False)),
-        cwd=config.get("agent_workdir"),
-        timeout_s=float(config.get("agent_prompt_timeout_s", 1800)),
-    )
+    run_manifests: list[dict] = []
+    total_chunks = len(teacher_plan.chunks)
+    for chunk_index, chunk in enumerate(teacher_plan.chunks, start=1):
+        prompt_result = run_agent_prompt(
+            agent_command=str(config["agent_command"]),
+            prompt=chunk.agent_prompt,
+            endpoint=config.get("agent_endpoint"),
+            config_path=config.get("agent_config_path"),
+            reasoning_enabled=bool(config.get("agent_reasoning_enabled", False)),
+            cwd=config.get("agent_workdir"),
+            timeout_s=float(config.get("agent_prompt_timeout_s", 1800)),
+        )
+        agent_run_label = f"chunk-{chunk_index:03d}"
+        write_agent_invocation_payload(
+            session_root=session_root,
+            name=f"agent_runs/{agent_run_label}.prompt.json",
+            invocation=prompt_result,
+        )
+        run_manifests.append(
+            append_run_artifacts(
+                session_root=session_root,
+                session_id=session_id,
+                run_dir=str(prompt_result.run_dir),
+                task=args.task,
+                teacher_prompt=teacher_prompt,
+                teacher_text=teacher_result.response_text,
+                agent_prompt=chunk.agent_prompt,
+                chunk_index=chunk_index,
+                chunk_count=total_chunks,
+                chunk_id=chunk.chunk_id,
+                chunk_title=chunk.title,
+                chunk_success_hint=chunk.success_hint,
+                include_unexecuted_steps=args.include_unexecuted_steps,
+                agent_run_label=agent_run_label,
+            )
+        )
 
-    manifest = collect_run_artifacts(
-        run_dir=str(prompt_result.run_dir),
-        output_dir=str(config["output_dir"]),
+    manifest = write_session_manifest(
+        session_root=session_root,
+        session_id=session_id,
         task=args.task,
         teacher_prompt=teacher_prompt,
         teacher_text=teacher_result.response_text,
-        teacher_result=teacher_result,
-        bootstrap_result=bootstrap_result,
-        prompt_result=prompt_result,
+        teacher_chunks=[
+            {
+                "chunk_id": chunk.chunk_id,
+                "title": chunk.title,
+                "agent_prompt": chunk.agent_prompt,
+                "success_hint": chunk.success_hint,
+                "notes": list(chunk.notes),
+            }
+            for chunk in teacher_plan.chunks
+        ],
+        run_manifests=run_manifests,
         session_outcome=args.session_outcome,
         session_note=args.session_note,
-        include_unexecuted_steps=args.include_unexecuted_steps,
     )
     print(json.dumps(manifest, ensure_ascii=False, indent=2))
     return 0
@@ -293,6 +398,8 @@ def build_parser() -> argparse.ArgumentParser:
     run_parser.add_argument("--teacher-command-template", default=None, help="External teacher command template. Use {prompt} placeholder.")
     run_parser.add_argument("--teacher-timeout-s", type=float, default=None, help="Teacher command timeout.")
     run_parser.add_argument("--teacher-workdir", default=None, help="Teacher command working directory.")
+    run_parser.add_argument("--teacher-split-enabled", action="store_true", help="Ask the teacher to split its own response into sequential agent chunks.")
+    run_parser.add_argument("--teacher-split-timeout-s", type=float, default=None, help="Teacher split command timeout.")
     run_parser.add_argument("--agent-command", default=None, help="Path or name of qwen-computer-use-agent.")
     run_parser.add_argument("--agent-model-id", default=None, help="Model path passed to qwen-computer-use-agent --model-id.")
     run_parser.add_argument("--agent-config-path", default=None, help="Config path passed to qwen-computer-use-agent --config.")

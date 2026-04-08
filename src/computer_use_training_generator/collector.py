@@ -41,7 +41,16 @@ def _step_sort_key(step_id: str) -> tuple[Any, ...]:
 
 
 def _write_json(path: Path, payload: dict) -> None:
+    path.parent.mkdir(parents=True, exist_ok=True)
     path.write_text(json.dumps(payload, ensure_ascii=False, indent=2), encoding="utf-8")
+
+
+def prepare_session_root(*, output_dir: str, task: str, session_id: str | None = None) -> tuple[str, Path]:
+    resolved_session_id = session_id or make_session_id(task)
+    session_root = Path(output_dir).resolve() / resolved_session_id
+    (session_root / "images").mkdir(parents=True, exist_ok=True)
+    (session_root / "agent_runs").mkdir(parents=True, exist_ok=True)
+    return resolved_session_id, session_root
 
 
 def _last_nonempty_line(text: str | None) -> str | None:
@@ -92,41 +101,46 @@ def _discover_step_maps(run_dir: Path) -> tuple[dict[str, dict], dict[str, dict]
     return request_map, response_map, executor_map
 
 
-def _derive_session_outcome(loop_summary: dict, override: str | None) -> str:
+def _derive_session_outcome_from_runs(run_summaries: list[dict], override: str | None) -> str:
     if override:
         return override
-    final_response = loop_summary.get("final_response") or {}
-    if final_response.get("done") is True:
+    if not run_summaries:
+        return "unknown"
+    if any((summary.get("last_execution") or {}).get("return_code") not in (None, 0) for summary in run_summaries):
+        return "fail"
+    if any(summary.get("stopped_reason") == "empty_generation" for summary in run_summaries):
+        return "fail"
+    if any((summary.get("final_response") or {}).get("done") is True for summary in run_summaries):
         return "success"
-    last_execution = loop_summary.get("last_execution") or {}
-    if last_execution.get("return_code") not in (None, 0):
-        return "fail"
-    stopped_reason = loop_summary.get("stopped_reason")
-    if stopped_reason in {"empty_generation"}:
-        return "fail"
     return "unknown"
 
 
-def collect_run_artifacts(
+def _append_samples(path: Path, samples: list[dict]) -> None:
+    with path.open("a", encoding="utf-8") as handle:
+        for sample in samples:
+            handle.write(json.dumps(sample, ensure_ascii=False))
+            handle.write("\n")
+
+
+def append_run_artifacts(
     *,
+    session_root: Path,
+    session_id: str,
     run_dir: str,
-    output_dir: str,
     task: str,
     teacher_prompt: str,
     teacher_text: str,
-    teacher_result: TeacherResult | None,
-    bootstrap_result: AgentInvocationResult | None,
-    prompt_result: AgentInvocationResult | None,
-    session_outcome: str | None,
-    session_note: str | None,
+    agent_prompt: str,
+    chunk_index: int | None,
+    chunk_count: int | None,
+    chunk_id: str | None,
+    chunk_title: str | None,
+    chunk_success_hint: str | None,
     include_unexecuted_steps: bool,
+    agent_run_label: str,
 ) -> dict:
     run_path = Path(run_dir).resolve()
-    session_id = make_session_id(task)
-    session_root = Path(output_dir).resolve() / session_id
     images_dir = session_root / "images"
-    images_dir.mkdir(parents=True, exist_ok=True)
-
     session_payload = _load_json(run_path / "session.json")
     loop_summary = _load_json(run_path / "loop-summary.json")
     request_map, response_map, executor_map = _discover_step_maps(run_path)
@@ -148,13 +162,13 @@ def collect_run_artifacts(
             before_path, before_sha = _save_image(
                 request.get("screenshot_base64"),
                 images_dir=images_dir,
-                filename=f"{step_id}.before.png",
+                filename=f"{agent_run_label}.{step_id}.before.png",
             )
         if executor:
             after_path, after_sha = _save_image(
                 executor.get("screenshot_base64"),
                 images_dir=images_dir,
-                filename=f"{step_id}.after.png",
+                filename=f"{agent_run_label}.{step_id}.after.png",
             )
 
         record = executor.get("record") if isinstance(executor, dict) else None
@@ -168,85 +182,199 @@ def collect_run_artifacts(
         else:
             outcome = "fail"
 
-        sample = {
-            "session_id": session_id,
-            "task": task,
-            "teacher_prompt": teacher_prompt,
-            "teacher_text": teacher_text,
-            "agent_prompt": teacher_text,
-            "agent_run_dir": str(run_path),
-            "step_id": step_id,
-            "step_index": response.get("step_index") if isinstance(response, dict) else None,
-            "request_kind": request.get("request_kind") if isinstance(request, dict) else None,
-            "replan_requested": request.get("replan_requested") if isinstance(request, dict) else None,
-            "strong_visual_grounding": request.get("strong_visual_grounding") if isinstance(request, dict) else None,
-            "reasoning_enabled": request.get("reasoning_enabled") if isinstance(request, dict) else None,
-            "before_image_path": before_path,
-            "before_image_sha256": before_sha,
-            "after_image_path": after_path,
-            "after_image_sha256": after_sha,
-            "state_text": request.get("observation_text") if isinstance(request, dict) else None,
-            "recent_result": {
-                "return_code": last_execution.get("return_code") if isinstance(last_execution, dict) else None,
-                "stderr_tail": last_execution.get("stderr_tail") if isinstance(last_execution, dict) else None,
-                "error_info": last_execution.get("error_info") if isinstance(last_execution, dict) else None,
-            },
-            "target_code": response.get("python_code") if isinstance(response, dict) else None,
-            "agent_raw_text": response.get("raw_text") if isinstance(response, dict) else None,
-            "agent_notes": response.get("notes") if isinstance(response, dict) else None,
-            "executor_stdout_tail": executor.get("stdout_tail") if isinstance(executor, dict) else None,
-            "executor_stderr_tail": executor.get("stderr_tail") if isinstance(executor, dict) else None,
-            "executor_error_info": executor.get("error_info") if isinstance(executor, dict) else None,
-            "return_code": return_code,
-            "outcome": outcome,
-            "failure_type": failure_type,
-            "failure_text": failure_text,
-        }
-        samples.append(sample)
+        samples.append(
+            {
+                "session_id": session_id,
+                "task": task,
+                "teacher_prompt": teacher_prompt,
+                "teacher_text": teacher_text,
+                "agent_prompt": agent_prompt,
+                "chunk_index": chunk_index,
+                "chunk_count": chunk_count,
+                "chunk_id": chunk_id,
+                "chunk_title": chunk_title,
+                "chunk_success_hint": chunk_success_hint,
+                "agent_run_label": agent_run_label,
+                "agent_run_dir": str(run_path),
+                "step_id": step_id,
+                "step_index": response.get("step_index") if isinstance(response, dict) else None,
+                "request_kind": request.get("request_kind") if isinstance(request, dict) else None,
+                "replan_requested": request.get("replan_requested") if isinstance(request, dict) else None,
+                "strong_visual_grounding": request.get("strong_visual_grounding") if isinstance(request, dict) else None,
+                "reasoning_enabled": request.get("reasoning_enabled") if isinstance(request, dict) else None,
+                "before_image_path": before_path,
+                "before_image_sha256": before_sha,
+                "after_image_path": after_path,
+                "after_image_sha256": after_sha,
+                "state_text": request.get("observation_text") if isinstance(request, dict) else None,
+                "recent_result": {
+                    "return_code": last_execution.get("return_code") if isinstance(last_execution, dict) else None,
+                    "stderr_tail": last_execution.get("stderr_tail") if isinstance(last_execution, dict) else None,
+                    "error_info": last_execution.get("error_info") if isinstance(last_execution, dict) else None,
+                },
+                "target_code": response.get("python_code") if isinstance(response, dict) else None,
+                "agent_raw_text": response.get("raw_text") if isinstance(response, dict) else None,
+                "agent_notes": response.get("notes") if isinstance(response, dict) else None,
+                "executor_stdout_tail": executor.get("stdout_tail") if isinstance(executor, dict) else None,
+                "executor_stderr_tail": executor.get("stderr_tail") if isinstance(executor, dict) else None,
+                "executor_error_info": executor.get("error_info") if isinstance(executor, dict) else None,
+                "return_code": return_code,
+                "outcome": outcome,
+                "failure_type": failure_type,
+                "failure_text": failure_text,
+            }
+        )
 
-    samples_path = session_root / "samples.jsonl"
-    with samples_path.open("w", encoding="utf-8") as handle:
-        for sample in samples:
-            handle.write(json.dumps(sample, ensure_ascii=False))
-            handle.write("\n")
+    _append_samples(session_root / "samples.jsonl", samples)
+    run_manifest = {
+        "agent_run_label": agent_run_label,
+        "chunk_index": chunk_index,
+        "chunk_count": chunk_count,
+        "chunk_id": chunk_id,
+        "chunk_title": chunk_title,
+        "chunk_success_hint": chunk_success_hint,
+        "source_run_dir": str(run_path),
+        "agent_user_prompt": session_payload.get("user_prompt"),
+        "policy": session_payload.get("policy"),
+        "sample_count": len(samples),
+        "loop_summary": loop_summary,
+    }
+    _write_json(session_root / "agent_runs" / f"{agent_run_label}.json", run_manifest)
+    return run_manifest
 
+
+def write_teacher_bundle(
+    *,
+    session_root: Path,
+    teacher_prompt: str,
+    teacher_text: str,
+    teacher_result: TeacherResult | None,
+    teacher_plan_payload: dict | None = None,
+) -> None:
     teacher_payload = {
         "prompt": teacher_prompt,
         "response_text": teacher_text,
         "command_result": asdict(teacher_result.command_result) if teacher_result else None,
     }
     _write_json(session_root / "teacher.json", teacher_payload)
+    if teacher_plan_payload is not None:
+        _write_json(session_root / "teacher_plan.json", teacher_plan_payload)
 
-    if bootstrap_result:
-        _write_json(
-            session_root / "agent_bootstrap.json",
-            {
-                "payload": bootstrap_result.payload,
-                "command_result": asdict(bootstrap_result.command_result),
-            },
-        )
-    if prompt_result:
-        _write_json(
-            session_root / "agent_prompt.json",
-            {
-                "payload": prompt_result.payload,
-                "command_result": asdict(prompt_result.command_result),
-            },
-        )
 
+def write_agent_invocation_payload(
+    *,
+    session_root: Path,
+    name: str,
+    invocation: AgentInvocationResult | None,
+) -> None:
+    if invocation is None:
+        return
+    _write_json(
+        session_root / name,
+        {
+            "payload": invocation.payload,
+            "command_result": asdict(invocation.command_result),
+        },
+    )
+
+
+def write_session_manifest(
+    *,
+    session_root: Path,
+    session_id: str,
+    task: str,
+    teacher_prompt: str,
+    teacher_text: str,
+    teacher_chunks: list[dict],
+    run_manifests: list[dict],
+    session_outcome: str | None,
+    session_note: str | None,
+) -> dict:
     manifest = {
         "session_id": session_id,
         "task": task,
         "teacher_prompt": teacher_prompt,
         "teacher_text": teacher_text,
-        "source_run_dir": str(run_path),
-        "agent_user_prompt": session_payload.get("user_prompt"),
-        "policy": session_payload.get("policy"),
-        "sample_count": len(samples),
-        "session_outcome": _derive_session_outcome(loop_summary, session_outcome),
+        "teacher_chunks": teacher_chunks,
+        "source_run_dirs": [item.get("source_run_dir") for item in run_manifests],
+        "sample_count": sum(int(item.get("sample_count", 0)) for item in run_manifests),
+        "run_count": len(run_manifests),
+        "session_outcome": _derive_session_outcome_from_runs(
+            [item.get("loop_summary") or {} for item in run_manifests],
+            session_outcome,
+        ),
         "session_note": session_note,
-        "loop_summary": loop_summary,
+        "agent_runs": run_manifests,
         "generated_at": datetime.now().isoformat(timespec="seconds"),
     }
     _write_json(session_root / "session.json", manifest)
     return manifest
+
+
+def collect_run_artifacts(
+    *,
+    run_dir: str,
+    output_dir: str,
+    task: str,
+    teacher_prompt: str,
+    teacher_text: str,
+    teacher_result: TeacherResult | None,
+    bootstrap_result: AgentInvocationResult | None,
+    prompt_result: AgentInvocationResult | None,
+    session_outcome: str | None,
+    session_note: str | None,
+    include_unexecuted_steps: bool,
+) -> dict:
+    session_id, session_root = prepare_session_root(output_dir=output_dir, task=task)
+    write_teacher_bundle(
+        session_root=session_root,
+        teacher_prompt=teacher_prompt,
+        teacher_text=teacher_text,
+        teacher_result=teacher_result,
+        teacher_plan_payload=None,
+    )
+    write_agent_invocation_payload(
+        session_root=session_root,
+        name="agent_bootstrap.json",
+        invocation=bootstrap_result,
+    )
+    write_agent_invocation_payload(
+        session_root=session_root,
+        name="agent_prompt.json",
+        invocation=prompt_result,
+    )
+    run_manifest = append_run_artifacts(
+        session_root=session_root,
+        session_id=session_id,
+        run_dir=run_dir,
+        task=task,
+        teacher_prompt=teacher_prompt,
+        teacher_text=teacher_text,
+        agent_prompt=teacher_text,
+        chunk_index=0,
+        chunk_count=1,
+        chunk_id="chunk-001",
+        chunk_title=task,
+        chunk_success_hint=None,
+        include_unexecuted_steps=include_unexecuted_steps,
+        agent_run_label="chunk-001",
+    )
+    return write_session_manifest(
+        session_root=session_root,
+        session_id=session_id,
+        task=task,
+        teacher_prompt=teacher_prompt,
+        teacher_text=teacher_text,
+        teacher_chunks=[
+            {
+                "chunk_id": "chunk-001",
+                "title": task,
+                "agent_prompt": teacher_text,
+                "success_hint": None,
+                "notes": ["single_chunk_legacy_flow"],
+            }
+        ],
+        run_manifests=[run_manifest],
+        session_outcome=session_outcome,
+        session_note=session_note,
+    )
