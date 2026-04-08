@@ -1,6 +1,8 @@
 {
   "teacher_command_template": "",
   "teacher_timeout_s": 300,
+  "teacher_split_enabled": true,
+  "teacher_split_timeout_s": 300,
   "teacher_workdir": null,
   "agent_command": "../../computer-use-raw-python-agent/.venv/bin/qwen-computer-use-agent",
   "agent_model_id": "../../models/Qwen3.5-9B",

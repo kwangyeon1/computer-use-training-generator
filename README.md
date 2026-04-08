@@ -1,6 +1,7 @@
 # computer-use-training-generator
 
-외부 teacher 모델의 자연어 응답을 그대로 `qwen-computer-use-agent`에 넣고,
+외부 teacher 모델의 자연어 응답을 먼저 만들고, 필요하면 teacher가 그 응답을 다시 순차 chunk로 분할한 뒤
+`qwen-computer-use-agent`에 조각별로 넣고,
 `computer-use-raw-python-executor` endpoint를 통해 실제 GUI 실행을 발생시킨 뒤
 step별 학습 샘플을 수집하는 generator repo입니다.
 
@@ -18,9 +19,12 @@ step별 학습 샘플을 수집하는 generator repo입니다.
 teacher prompt
   -> external teacher command
   -> teacher response text
-  -> qwen-computer-use-agent --prompt "<teacher response>"
-  -> agent run artifacts
-  -> step JSONL + before/after PNG extraction
+  -> teacher chunk plan JSON
+  -> qwen-computer-use-agent --prompt "<chunk 1>"
+  -> qwen-computer-use-agent --prompt "<chunk 2>"
+  -> ...
+  -> agent run artifacts (multiple runs)
+  -> step JSONL + before/after PNG extraction + per-chunk metadata
 ```
 
 이 repo는 agent나 executor를 직접 재구현하지 않습니다.
@@ -53,9 +57,10 @@ cd /home/kss930/model-projects/gui-owl-8B-think-1.0.0/computer-use-training-gene
 
 위 흐름은:
 1. teacher에게 `안드로이드 설치방법`을 질문
-2. teacher 응답 전문을 agent prompt로 사용
-3. agent run dir를 수집
-4. step별 JSONL과 PNG를 저장
+2. teacher 응답을 teacher가 다시 순차 chunk로 분할
+3. 각 chunk를 agent prompt로 순차 실행
+4. 여러 agent run dir를 한 세션으로 수집
+5. step별 JSONL과 PNG를 저장
 
 ## 결과물
 
@@ -63,7 +68,9 @@ cd /home/kss930/model-projects/gui-owl-8B-think-1.0.0/computer-use-training-gene
 
 - `teacher.json`
 - `agent_bootstrap.json`
-- `agent_prompt.json`
+- `teacher_plan.json`
+- `agent_runs/*.prompt.json`
+- `agent_runs/*.json`
 - `session.json`
 - `samples.jsonl`
 - `images/*.png`
@@ -76,6 +83,11 @@ cd /home/kss930/model-projects/gui-owl-8B-think-1.0.0/computer-use-training-gene
   "task": "안드로이드 설치방법",
   "teacher_prompt": "안드로이드 설치방법",
   "teacher_text": "...외부 teacher 응답...",
+  "chunk_index": 1,
+  "chunk_count": 4,
+  "chunk_id": "chunk-001",
+  "chunk_title": "공식 다운로드 페이지 열기",
+  "chunk_success_hint": "카카오톡 공식 페이지가 브라우저에 열림",
   "step_id": "step-000",
   "request_kind": "generate",
   "before_image_path": "images/step-000.before.png",
@@ -99,6 +111,23 @@ cd /home/kss930/model-projects/gui-owl-8B-think-1.0.0/computer-use-training-gene
 ```
 
 template 안에 `{prompt}`가 없으면 마지막 인자로 teacher prompt를 자동으로 붙입니다.
+
+## teacher 분할
+
+기본값으로 `run-session`은 teacher 원문을 다시 teacher에게 넣어 순차 chunk JSON으로 분할합니다.
+
+기본 config 키:
+- `teacher_split_enabled`
+- `teacher_split_timeout_s`
+
+각 chunk는:
+- `chunk_id`
+- `title`
+- `agent_prompt`
+- `success_hint`
+
+형태로 저장되고, agent에는 `agent_prompt`가 1조각씩 순차적으로 들어갑니다.
+분할 개수는 기본적으로 고정하지 않고, teacher가 task 성격에 맞게 정한 chunk 수를 그대로 사용합니다.
 
 ## 기존 run만 수집
 
