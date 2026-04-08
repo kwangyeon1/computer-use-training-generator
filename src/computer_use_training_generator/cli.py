@@ -2,7 +2,11 @@ from __future__ import annotations
 
 import argparse
 import json
+import os
 from pathlib import Path
+import shutil
+import subprocess
+import sys
 
 from .agent import bootstrap_agent, run_agent_prompt
 from .collector import collect_run_artifacts
@@ -10,8 +14,34 @@ from .config_utils import load_generator_config
 from .teacher import run_teacher
 
 
+def _find_existing_path(candidates: list[Path]) -> Path | None:
+    for candidate in candidates:
+        try:
+            resolved = candidate.resolve()
+        except OSError:
+            continue
+        if resolved.exists():
+            return resolved
+    return None
+
+
 def _default_config_path() -> Path:
-    return (Path(__file__).resolve().parents[2] / "config" / "generator.default.json").resolve()
+    candidates: list[Path] = []
+    cwd = Path.cwd()
+    candidates.append(cwd / "config" / "generator.default.json")
+
+    argv0 = Path(sys.argv[0]).resolve()
+    for parent in argv0.parents:
+        candidates.append(parent / "config" / "generator.default.json")
+
+    module_path = Path(__file__).resolve()
+    for parent in module_path.parents:
+        candidates.append(parent / "config" / "generator.default.json")
+
+    resolved = _find_existing_path(candidates)
+    if resolved is not None:
+        return resolved
+    return (cwd / "config" / "generator.default.json").resolve()
 
 
 def _load_config(path: str | None) -> tuple[dict, Path | None]:
@@ -49,6 +79,124 @@ def _build_effective_config(args: argparse.Namespace) -> tuple[dict, Path | None
     if getattr(args, "output_dir", None) is not None:
         config["output_dir"] = str(Path(args.output_dir).resolve())
     return config, config_path
+
+
+def _request_terminal_attention(message: str) -> None:
+    stream = sys.stderr if sys.stderr.isatty() else None
+    owned_stream = None
+    if stream is None:
+        tty_path = "CONOUT$" if os.name == "nt" else "/dev/tty"
+        try:
+            owned_stream = open(tty_path, "w", encoding="utf-8", buffering=1)
+            stream = owned_stream
+        except OSError:
+            return
+    try:
+        title = f"training-generator finished: {message}"
+        # Set a distinctive title first so external window-raise helpers can find it.
+        stream.write(f"\x1b]0;{title}\x07")
+        # Best-effort terminal attention request for interactive shells:
+        # de-iconify, raise window, then ring the bell.
+        stream.write("\n\x1b[1t\x1b[5t\a")
+        stream.write(f"[training-generator] {message}\n")
+        stream.flush()
+        _raise_terminal_window(title)
+    finally:
+        if owned_stream is not None:
+            owned_stream.close()
+
+
+def _raise_terminal_window(title: str) -> None:
+    if _raise_terminal_window_wsl(title):
+        return
+    if _raise_terminal_window_x11(title):
+        return
+
+
+def _raise_terminal_window_x11(title: str) -> bool:
+    if not os.environ.get("DISPLAY"):
+        return False
+    xdotool = shutil.which("xdotool")
+    if xdotool:
+        try:
+            subprocess.run(
+                [xdotool, "search", "--name", title, "windowraise", "--sync"],
+                check=False,
+                stdout=subprocess.DEVNULL,
+                stderr=subprocess.DEVNULL,
+            )
+            return True
+        except OSError:
+            pass
+    wmctrl = shutil.which("wmctrl")
+    if wmctrl:
+        try:
+            subprocess.run(
+                [wmctrl, "-a", title],
+                check=False,
+                stdout=subprocess.DEVNULL,
+                stderr=subprocess.DEVNULL,
+            )
+            return True
+        except OSError:
+            pass
+    return False
+
+
+def _raise_terminal_window_wsl(title: str) -> bool:
+    if not os.environ.get("WSL_DISTRO_NAME"):
+        return False
+    powershell = shutil.which("powershell.exe")
+    if not powershell:
+        return False
+    script = rf"""
+$title = {title!r}
+$sig = @'
+using System;
+using System.Runtime.InteropServices;
+using System.Text;
+public static class Win32Raise {{
+  public delegate bool EnumWindowsProc(IntPtr hWnd, IntPtr lParam);
+  [DllImport("user32.dll")] public static extern bool EnumWindows(EnumWindowsProc lpEnumFunc, IntPtr lParam);
+  [DllImport("user32.dll", CharSet = CharSet.Unicode)] public static extern int GetWindowText(IntPtr hWnd, StringBuilder text, int count);
+  [DllImport("user32.dll")] public static extern bool IsWindowVisible(IntPtr hWnd);
+  [DllImport("user32.dll")] public static extern bool ShowWindowAsync(IntPtr hWnd, int nCmdShow);
+  [DllImport("user32.dll")] public static extern bool SetWindowPos(IntPtr hWnd, IntPtr hWndInsertAfter, int X, int Y, int cx, int cy, uint uFlags);
+}}
+'@
+Add-Type -TypeDefinition $sig -ErrorAction SilentlyContinue | Out-Null
+$HWND_TOPMOST = [IntPtr](-1)
+$HWND_NOTOPMOST = [IntPtr](-2)
+$SWP_NOMOVE = 0x0002
+$SWP_NOSIZE = 0x0001
+$SWP_SHOWWINDOW = 0x0040
+$SWP_NOACTIVATE = 0x0010
+$flags = $SWP_NOMOVE -bor $SWP_NOSIZE -bor $SWP_SHOWWINDOW -bor $SWP_NOACTIVATE
+[Win32Raise]::EnumWindows({{
+  param($hWnd, $lParam)
+  if (-not [Win32Raise]::IsWindowVisible($hWnd)) {{ return $true }}
+  $sb = New-Object System.Text.StringBuilder 512
+  [void][Win32Raise]::GetWindowText($hWnd, $sb, $sb.Capacity)
+  $text = $sb.ToString()
+  if ($text -and $text.Contains($title)) {{
+    [void][Win32Raise]::ShowWindowAsync($hWnd, 9)
+    [void][Win32Raise]::SetWindowPos($hWnd, $HWND_TOPMOST, 0, 0, 0, 0, $flags)
+    [void][Win32Raise]::SetWindowPos($hWnd, $HWND_NOTOPMOST, 0, 0, 0, 0, $flags)
+    return $false
+  }}
+  return $true
+}}, [IntPtr]::Zero) | Out-Null
+"""
+    try:
+        subprocess.run(
+            [powershell, "-NoProfile", "-Command", script],
+            check=False,
+            stdout=subprocess.DEVNULL,
+            stderr=subprocess.DEVNULL,
+        )
+        return True
+    except OSError:
+        return False
 
 
 def cmd_run_session(args: argparse.Namespace) -> int:
@@ -178,7 +326,11 @@ def build_parser() -> argparse.ArgumentParser:
 def main() -> int:
     parser = build_parser()
     args = parser.parse_args()
-    return int(args.func(args))
+    try:
+        return int(args.func(args))
+    finally:
+        if getattr(args, "command", None) == "run-session":
+            _request_terminal_attention("run-session finished")
 
 
 if __name__ == "__main__":
