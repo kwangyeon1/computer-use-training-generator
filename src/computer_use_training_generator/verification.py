@@ -18,6 +18,18 @@ _ALLOWED_CHECK_KINDS = {
 }
 
 
+def _strip_screenshot_base64(value: Any) -> Any:
+    if isinstance(value, dict):
+        return {
+            key: _strip_screenshot_base64(item)
+            for key, item in value.items()
+            if key != "screenshot_base64"
+        }
+    if isinstance(value, list):
+        return [_strip_screenshot_base64(item) for item in value]
+    return value
+
+
 def _normalize_verification_spec(verification: dict[str, object] | None) -> dict[str, object] | None:
     if not isinstance(verification, dict):
         return None
@@ -239,5 +251,5 @@ def run_chunk_verification(
         stdout_tail=stdout_tail if isinstance(stdout_tail, str) else None,
         stderr_tail=stderr_tail if isinstance(stderr_tail, str) else None,
         error=error,
-        executor_payload=payload if isinstance(payload, dict) else {},
+        executor_payload=_strip_screenshot_base64(payload) if isinstance(payload, dict) else {},
     )
