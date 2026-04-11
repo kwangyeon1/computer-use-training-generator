@@ -4,6 +4,8 @@
   "teacher_split_enabled": true,
   "teacher_split_timeout_s": 300,
   "teacher_workdir": null,
+  "chunk_verification_enabled": true,
+  "chunk_verification_timeout_s": 60,
   "agent_command": "../../computer-use-raw-python-agent/.venv/bin/qwen-computer-use-agent",
   "agent_model_id": "../../models/Qwen3.5-9B",
   "agent_config_path": "../../computer-use-raw-python-agent/config/agent.qwen35.default.json",

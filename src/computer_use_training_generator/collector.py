@@ -115,6 +115,24 @@ def _derive_session_outcome_from_runs(run_summaries: list[dict], override: str |
     return "unknown"
 
 
+def _derive_session_outcome(
+    *,
+    run_summaries: list[dict],
+    chunk_results: list[dict],
+    override: str | None,
+) -> str:
+    if override:
+        return override
+    if chunk_results:
+        if all(bool(item.get("completed")) for item in chunk_results):
+            return "success"
+        if any(item.get("stopped_reason") == "chunk_verification_failed" for item in chunk_results):
+            return "fail"
+        if any(bool(item.get("started")) and not bool(item.get("completed")) for item in chunk_results):
+            return "fail"
+    return _derive_session_outcome_from_runs(run_summaries, None)
+
+
 def _append_samples(path: Path, samples: list[dict]) -> None:
     with path.open("a", encoding="utf-8") as handle:
         for sample in samples:
@@ -136,6 +154,13 @@ def append_run_artifacts(
     chunk_id: str | None,
     chunk_title: str | None,
     chunk_success_hint: str | None,
+    chunk_preconditions: list[str] | None,
+    chunk_verification: dict | None,
+    chunk_max_retries: int | None,
+    chunk_on_fail: str | None,
+    chunk_attempt: int,
+    chunk_completed: bool,
+    chunk_verification_result: dict | None,
     include_unexecuted_steps: bool,
     agent_run_label: str,
 ) -> dict:
@@ -194,6 +219,13 @@ def append_run_artifacts(
                 "chunk_id": chunk_id,
                 "chunk_title": chunk_title,
                 "chunk_success_hint": chunk_success_hint,
+                "chunk_preconditions": chunk_preconditions,
+                "chunk_verification": chunk_verification,
+                "chunk_max_retries": chunk_max_retries,
+                "chunk_on_fail": chunk_on_fail,
+                "chunk_attempt": chunk_attempt,
+                "chunk_completed": chunk_completed,
+                "chunk_verification_result": chunk_verification_result,
                 "agent_run_label": agent_run_label,
                 "agent_run_dir": str(run_path),
                 "step_id": step_id,
@@ -233,6 +265,13 @@ def append_run_artifacts(
         "chunk_id": chunk_id,
         "chunk_title": chunk_title,
         "chunk_success_hint": chunk_success_hint,
+        "chunk_preconditions": chunk_preconditions,
+        "chunk_verification": chunk_verification,
+        "chunk_max_retries": chunk_max_retries,
+        "chunk_on_fail": chunk_on_fail,
+        "chunk_attempt": chunk_attempt,
+        "chunk_completed": chunk_completed,
+        "chunk_verification_result": chunk_verification_result,
         "source_run_dir": str(run_path),
         "agent_user_prompt": session_payload.get("user_prompt"),
         "policy": session_payload.get("policy"),
@@ -286,9 +325,11 @@ def write_session_manifest(
     teacher_prompt: str,
     teacher_text: str,
     teacher_chunks: list[dict],
+    chunk_results: list[dict],
     run_manifests: list[dict],
     session_outcome: str | None,
     session_note: str | None,
+    stopped_reason: str | None,
 ) -> dict:
     manifest = {
         "session_id": session_id,
@@ -296,12 +337,17 @@ def write_session_manifest(
         "teacher_prompt": teacher_prompt,
         "teacher_text": teacher_text,
         "teacher_chunks": teacher_chunks,
+        "chunk_results": chunk_results,
         "source_run_dirs": [item.get("source_run_dir") for item in run_manifests],
         "sample_count": sum(int(item.get("sample_count", 0)) for item in run_manifests),
         "run_count": len(run_manifests),
-        "session_outcome": _derive_session_outcome_from_runs(
-            [item.get("loop_summary") or {} for item in run_manifests],
-            session_outcome,
+        "expected_chunk_count": len(teacher_chunks),
+        "completed_chunk_count": sum(1 for item in chunk_results if bool(item.get("completed"))),
+        "stopped_reason": stopped_reason,
+        "session_outcome": _derive_session_outcome(
+            run_summaries=[item.get("loop_summary") or {} for item in run_manifests],
+            chunk_results=chunk_results,
+            override=session_outcome,
         ),
         "session_note": session_note,
         "agent_runs": run_manifests,
@@ -356,9 +402,19 @@ def collect_run_artifacts(
         chunk_id="chunk-001",
         chunk_title=task,
         chunk_success_hint=None,
+        chunk_preconditions=[],
+        chunk_verification=None,
+        chunk_max_retries=0,
+        chunk_on_fail="fail_session",
+        chunk_attempt=1,
+        chunk_completed=False,
+        chunk_verification_result=None,
         include_unexecuted_steps=include_unexecuted_steps,
         agent_run_label="chunk-001",
     )
+    legacy_loop_summary = run_manifest.get("loop_summary") or {}
+    legacy_final_response = legacy_loop_summary.get("final_response") or {}
+    legacy_completed = bool(legacy_final_response.get("done")) or str(legacy_loop_summary.get("stopped_reason") or "") == "task_completed"
     return write_session_manifest(
         session_root=session_root,
         session_id=session_id,
@@ -371,10 +427,28 @@ def collect_run_artifacts(
                 "title": task,
                 "agent_prompt": teacher_text,
                 "success_hint": None,
+                "preconditions": [],
+                "verification": None,
+                "max_retries": 0,
+                "on_fail": "fail_session",
                 "notes": ["single_chunk_legacy_flow"],
+            }
+        ],
+        chunk_results=[
+            {
+                "chunk_id": "chunk-001",
+                "title": task,
+                "completed": legacy_completed,
+                "started": True,
+                "attempts_used": 1,
+                "max_retries": 0,
+                "on_fail": "fail_session",
+                "verification_result": None,
+                "stopped_reason": None if legacy_completed else legacy_loop_summary.get("stopped_reason"),
             }
         ],
         run_manifests=[run_manifest],
         session_outcome=session_outcome,
         session_note=session_note,
+        stopped_reason=None,
     )

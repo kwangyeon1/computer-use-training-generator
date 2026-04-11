@@ -20,7 +20,18 @@ Requirements:
         "chunk_id": "chunk-001",
         "title": "short title",
         "agent_prompt": "natural-language instruction to send directly to the agent for only this chunk",
-        "success_hint": "short success condition"
+        "success_hint": "short success condition",
+        "preconditions": ["short prerequisite that should already hold before this chunk"],
+        "verification": {{
+          "checks": [
+            {{"kind": "path_exists", "path": "~/Downloads/example.exe"}},
+            {{"kind": "file_exists_glob", "pattern": "~/Downloads/example-*.exe"}},
+            {{"kind": "file_size_gt", "pattern": "~/Downloads/example-*.exe", "bytes": 1000000}},
+            {{"kind": "process_exists", "name": "KakaoTalk.exe"}}
+          ]
+        }},
+        "max_retries": 1,
+        "on_fail": "retry_current_chunk"
       }}
     ]
   }}
@@ -31,6 +42,12 @@ Requirements:
 - Keep chunk prompts self-contained enough for the agent, but assume previous chunks have already run.
 - Use as many chunks as needed, but keep them compact and stage-focused.
 - If the original answer contains official URLs or important warnings, keep them in the relevant chunk prompt.
+- Each chunk must include a read-only verification plan.
+- Verification must use only the allowed check kinds: `path_exists`, `file_exists_glob`, `file_size_gt`, `process_exists`.
+- Do not output raw Python for verification.
+- `preconditions` should describe what must already be true before the chunk starts.
+- `max_retries` should be a small integer, usually 0, 1, or 2.
+- `on_fail` must be either `retry_current_chunk` or `fail_session`.
 - Do not add commentary outside JSON.
 
 Overall task:
@@ -93,6 +110,18 @@ def _normalize_chunks(payload: dict, *, source_task: str, source_text: str) -> l
         chunk_id = str(item.get("chunk_id") or f"chunk-{index:03d}").strip() or f"chunk-{index:03d}"
         title = str(item.get("title") or f"Chunk {index}").strip() or f"Chunk {index}"
         success_hint = str(item.get("success_hint") or "").strip() or None
+        preconditions = [str(value).strip() for value in item.get("preconditions", []) if str(value).strip()] if isinstance(item.get("preconditions"), list) else []
+        raw_verification = item.get("verification")
+        verification = raw_verification if isinstance(raw_verification, dict) else None
+        raw_max_retries = item.get("max_retries")
+        try:
+            max_retries = int(raw_max_retries) if raw_max_retries is not None else (1 if verification else 0)
+        except (TypeError, ValueError):
+            max_retries = 1 if verification else 0
+        max_retries = max(0, min(2, max_retries))
+        on_fail = str(item.get("on_fail") or ("retry_current_chunk" if max_retries > 0 else "fail_session")).strip().lower()
+        if on_fail not in {"retry_current_chunk", "fail_session"}:
+            on_fail = "retry_current_chunk" if max_retries > 0 else "fail_session"
         notes = [str(value).strip() for value in item.get("notes", []) if str(value).strip()] if isinstance(item.get("notes"), list) else []
         normalized.append(
             TeacherTaskChunk(
@@ -100,6 +129,10 @@ def _normalize_chunks(payload: dict, *, source_task: str, source_text: str) -> l
                 title=title,
                 agent_prompt=agent_prompt,
                 success_hint=success_hint,
+                preconditions=preconditions,
+                verification=verification,
+                max_retries=max_retries,
+                on_fail=on_fail,
                 notes=notes,
             )
         )
@@ -111,6 +144,10 @@ def _normalize_chunks(payload: dict, *, source_task: str, source_text: str) -> l
             title=source_task,
             agent_prompt=source_text,
             success_hint=None,
+            preconditions=[],
+            verification=None,
+            max_retries=0,
+            on_fail="fail_session",
             notes=["fallback_single_chunk"],
         )
     ]
@@ -144,6 +181,10 @@ def split_teacher_response(
                 title=task,
                 agent_prompt=teacher_text,
                 success_hint=None,
+                preconditions=[],
+                verification=None,
+                max_retries=0,
+                on_fail="fail_session",
                 notes=["fallback_due_to_split_parse_failure"],
             )
         ]

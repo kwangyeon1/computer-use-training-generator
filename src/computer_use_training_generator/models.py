@@ -26,6 +26,10 @@ class TeacherTaskChunk:
     title: str
     agent_prompt: str
     success_hint: str | None = None
+    preconditions: list[str] = field(default_factory=list)
+    verification: dict[str, object] | None = None
+    max_retries: int = 0
+    on_fail: str = "fail_session"
     notes: list[str] = field(default_factory=list)
 
 
@@ -42,3 +46,16 @@ class AgentInvocationResult:
     payload: dict
     command_result: CommandResult
     run_dir: str | None
+
+
+@dataclass(slots=True)
+class ChunkVerificationResult:
+    verification: dict[str, object] | None
+    verification_code: str | None
+    passed: bool
+    return_code: int | None
+    evidence: list[dict[str, object]] = field(default_factory=list)
+    stdout_tail: str | None = None
+    stderr_tail: str | None = None
+    error: str | None = None
+    executor_payload: dict[str, object] = field(default_factory=dict)

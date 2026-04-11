@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 import argparse
+from dataclasses import asdict
 import json
 import os
 from pathlib import Path
@@ -20,6 +21,7 @@ from .collector import (
 from .config_utils import load_generator_config
 from .models import TeacherChunkPlanResult, TeacherTaskChunk
 from .teacher import run_teacher, split_teacher_response
+from .verification import run_chunk_verification, write_verification_artifact
 
 
 def _find_existing_path(candidates: list[Path]) -> Path | None:
@@ -83,13 +85,58 @@ def _build_effective_config(args: argparse.Namespace) -> tuple[dict, Path | None
     _override(config, "agent_workdir", getattr(args, "agent_workdir", None))
     _override(config, "agent_bootstrap_timeout_s", getattr(args, "agent_bootstrap_timeout_s", None))
     _override(config, "agent_prompt_timeout_s", getattr(args, "agent_prompt_timeout_s", None))
+    _override(config, "chunk_verification_timeout_s", getattr(args, "chunk_verification_timeout_s", None))
     if getattr(args, "teacher_split_enabled", False):
         config["teacher_split_enabled"] = True
     if getattr(args, "agent_reasoning_enabled", False):
         config["agent_reasoning_enabled"] = True
+    if getattr(args, "chunk_verification_enabled", False):
+        config["chunk_verification_enabled"] = True
     if getattr(args, "output_dir", None) is not None:
         config["output_dir"] = str(Path(args.output_dir).resolve())
     return config, config_path
+
+
+def _serialize_chunk(chunk: TeacherTaskChunk) -> dict:
+    return {
+        "chunk_id": chunk.chunk_id,
+        "title": chunk.title,
+        "agent_prompt": chunk.agent_prompt,
+        "success_hint": chunk.success_hint,
+        "preconditions": list(chunk.preconditions),
+        "verification": chunk.verification,
+        "max_retries": chunk.max_retries,
+        "on_fail": chunk.on_fail,
+        "notes": list(chunk.notes),
+    }
+
+
+def _compose_chunk_prompt(chunk: TeacherTaskChunk) -> str:
+    parts = [chunk.agent_prompt.strip()]
+    if chunk.success_hint:
+        parts.append(f"Current chunk success target: {chunk.success_hint}")
+    if chunk.preconditions:
+        parts.append("Preconditions expected before or during this chunk:\n- " + "\n- ".join(chunk.preconditions))
+    parts.append("Do only this chunk. Do not skip ahead to later chunks.")
+    return "\n\n".join(part for part in parts if part)
+
+
+def _compose_retry_prompt(*, chunk: TeacherTaskChunk, verification_result: dict, attempt_index: int) -> str:
+    evidence = verification_result.get("evidence")
+    error = verification_result.get("error")
+    evidence_text = json.dumps(evidence, ensure_ascii=False, indent=2) if evidence else "[]"
+    retry_header = f"Previous attempt {attempt_index} did not satisfy the chunk verifier. Retry only this chunk."
+    details = [retry_header]
+    if error:
+        details.append(f"Verifier error: {error}")
+    details.append(f"Verifier evidence:\n{evidence_text}")
+    return _compose_chunk_prompt(chunk) + "\n\n" + "\n\n".join(details)
+
+
+def _chunk_completed_from_agent_payload(payload: dict) -> bool:
+    summary = payload.get("summary") or {}
+    final_response = summary.get("final_response") or {}
+    return bool(final_response.get("done")) or str(summary.get("stopped_reason") or "") == "task_completed"
 
 
 def _request_terminal_attention(message: str) -> None:
@@ -240,6 +287,10 @@ def cmd_run_session(args: argparse.Namespace) -> int:
                     title=args.task,
                     agent_prompt=teacher_result.response_text,
                     success_hint=None,
+                    preconditions=[],
+                    verification=None,
+                    max_retries=0,
+                    on_fail="fail_session",
                     notes=["teacher_split_disabled"],
                 )
             ],
@@ -256,13 +307,7 @@ def cmd_run_session(args: argparse.Namespace) -> int:
             "source_task": teacher_plan.source_task,
             "source_text": teacher_plan.source_text,
             "chunks": [
-                {
-                    "chunk_id": chunk.chunk_id,
-                    "title": chunk.title,
-                    "agent_prompt": chunk.agent_prompt,
-                    "success_hint": chunk.success_hint,
-                    "notes": list(chunk.notes),
-                }
+                _serialize_chunk(chunk)
                 for chunk in teacher_plan.chunks
             ],
             "command_result": {
@@ -297,40 +342,142 @@ def cmd_run_session(args: argparse.Namespace) -> int:
         )
 
     run_manifests: list[dict] = []
+    chunk_results: list[dict] = []
     total_chunks = len(teacher_plan.chunks)
+    stopped_reason: str | None = None
+    chunk_verification_enabled = bool(config.get("chunk_verification_enabled", True))
     for chunk_index, chunk in enumerate(teacher_plan.chunks, start=1):
-        prompt_result = run_agent_prompt(
-            agent_command=str(config["agent_command"]),
-            prompt=chunk.agent_prompt,
-            endpoint=config.get("agent_endpoint"),
-            config_path=config.get("agent_config_path"),
-            reasoning_enabled=bool(config.get("agent_reasoning_enabled", False)),
-            cwd=config.get("agent_workdir"),
-            timeout_s=float(config.get("agent_prompt_timeout_s", 1800)),
-        )
-        agent_run_label = f"chunk-{chunk_index:03d}"
-        write_agent_invocation_payload(
-            session_root=session_root,
-            name=f"agent_runs/{agent_run_label}.prompt.json",
-            invocation=prompt_result,
-        )
-        run_manifests.append(
-            append_run_artifacts(
-                session_root=session_root,
-                session_id=session_id,
-                run_dir=str(prompt_result.run_dir),
-                task=args.task,
-                teacher_prompt=teacher_prompt,
-                teacher_text=teacher_result.response_text,
-                agent_prompt=chunk.agent_prompt,
-                chunk_index=chunk_index,
-                chunk_count=total_chunks,
-                chunk_id=chunk.chunk_id,
-                chunk_title=chunk.title,
-                chunk_success_hint=chunk.success_hint,
-                include_unexecuted_steps=args.include_unexecuted_steps,
-                agent_run_label=agent_run_label,
+        attempt_index = 0
+        chunk_completed = False
+        final_verification_result: dict | None = None
+        final_run_label: str | None = None
+        final_run_dir: str | None = None
+        attempts_used = 0
+        while True:
+            attempts_used += 1
+            prompt_text = _compose_chunk_prompt(chunk)
+            if attempt_index > 0 and final_verification_result is not None:
+                prompt_text = _compose_retry_prompt(
+                    chunk=chunk,
+                    verification_result=final_verification_result,
+                    attempt_index=attempt_index,
+                )
+            prompt_result = run_agent_prompt(
+                agent_command=str(config["agent_command"]),
+                prompt=prompt_text,
+                endpoint=config.get("agent_endpoint"),
+                config_path=config.get("agent_config_path"),
+                reasoning_enabled=bool(config.get("agent_reasoning_enabled", False)),
+                cwd=config.get("agent_workdir"),
+                timeout_s=float(config.get("agent_prompt_timeout_s", 1800)),
             )
+            agent_run_label = f"chunk-{chunk_index:03d}.attempt-{attempt_index + 1:02d}"
+            final_run_label = agent_run_label
+            final_run_dir = str(prompt_result.run_dir)
+            write_agent_invocation_payload(
+                session_root=session_root,
+                name=f"agent_runs/{agent_run_label}.prompt.json",
+                invocation=prompt_result,
+            )
+            verification_result_obj = None
+            if chunk_verification_enabled:
+                verification_result_obj = run_chunk_verification(
+                    endpoint=config.get("agent_endpoint"),
+                    timeout_s=float(config.get("chunk_verification_timeout_s", 60)),
+                    session_id=session_id,
+                    agent_run_label=agent_run_label,
+                    chunk=chunk,
+                )
+                if verification_result_obj is not None:
+                    write_verification_artifact(
+                        session_root=session_root,
+                        agent_run_label=agent_run_label,
+                        result=verification_result_obj,
+                    )
+            verification_payload = asdict(verification_result_obj) if verification_result_obj is not None else None
+            final_verification_result = verification_payload
+            chunk_completed = (
+                bool(verification_payload.get("passed"))
+                if verification_payload is not None
+                else _chunk_completed_from_agent_payload(prompt_result.payload)
+            )
+            run_manifests.append(
+                append_run_artifacts(
+                    session_root=session_root,
+                    session_id=session_id,
+                    run_dir=str(prompt_result.run_dir),
+                    task=args.task,
+                    teacher_prompt=teacher_prompt,
+                    teacher_text=teacher_result.response_text,
+                    agent_prompt=prompt_text,
+                    chunk_index=chunk_index,
+                    chunk_count=total_chunks,
+                    chunk_id=chunk.chunk_id,
+                    chunk_title=chunk.title,
+                    chunk_success_hint=chunk.success_hint,
+                    chunk_preconditions=list(chunk.preconditions),
+                    chunk_verification=chunk.verification,
+                    chunk_max_retries=chunk.max_retries,
+                    chunk_on_fail=chunk.on_fail,
+                    chunk_attempt=attempt_index + 1,
+                    chunk_completed=chunk_completed,
+                    chunk_verification_result=verification_payload,
+                    include_unexecuted_steps=args.include_unexecuted_steps,
+                    agent_run_label=agent_run_label,
+                )
+            )
+            if chunk_completed:
+                break
+            if chunk.on_fail == "retry_current_chunk" and attempt_index < chunk.max_retries:
+                attempt_index += 1
+                continue
+            stopped_reason = "chunk_verification_failed" if verification_payload is not None else "chunk_incomplete"
+            break
+
+        chunk_results.append(
+            {
+                "chunk_index": chunk_index,
+                "chunk_count": total_chunks,
+                "chunk_id": chunk.chunk_id,
+                "title": chunk.title,
+                "success_hint": chunk.success_hint,
+                "preconditions": list(chunk.preconditions),
+                "verification": chunk.verification,
+                "max_retries": chunk.max_retries,
+                "on_fail": chunk.on_fail,
+                "started": True,
+                "completed": chunk_completed,
+                "attempts_used": attempts_used,
+                "final_agent_run_label": final_run_label,
+                "final_source_run_dir": final_run_dir,
+                "verification_result": final_verification_result,
+                "stopped_reason": None if chunk_completed else stopped_reason,
+            }
+        )
+        if not chunk_completed:
+            break
+
+    completed_chunks = len(chunk_results)
+    for remaining_index, chunk in enumerate(teacher_plan.chunks[completed_chunks:], start=completed_chunks + 1):
+        chunk_results.append(
+            {
+                "chunk_index": remaining_index,
+                "chunk_count": total_chunks,
+                "chunk_id": chunk.chunk_id,
+                "title": chunk.title,
+                "success_hint": chunk.success_hint,
+                "preconditions": list(chunk.preconditions),
+                "verification": chunk.verification,
+                "max_retries": chunk.max_retries,
+                "on_fail": chunk.on_fail,
+                "started": False,
+                "completed": False,
+                "attempts_used": 0,
+                "final_agent_run_label": None,
+                "final_source_run_dir": None,
+                "verification_result": None,
+                "stopped_reason": "not_started_due_to_previous_chunk_failure" if stopped_reason else None,
+            }
         )
 
     manifest = write_session_manifest(
@@ -339,19 +486,12 @@ def cmd_run_session(args: argparse.Namespace) -> int:
         task=args.task,
         teacher_prompt=teacher_prompt,
         teacher_text=teacher_result.response_text,
-        teacher_chunks=[
-            {
-                "chunk_id": chunk.chunk_id,
-                "title": chunk.title,
-                "agent_prompt": chunk.agent_prompt,
-                "success_hint": chunk.success_hint,
-                "notes": list(chunk.notes),
-            }
-            for chunk in teacher_plan.chunks
-        ],
+        teacher_chunks=[_serialize_chunk(chunk) for chunk in teacher_plan.chunks],
+        chunk_results=chunk_results,
         run_manifests=run_manifests,
         session_outcome=args.session_outcome,
         session_note=args.session_note,
+        stopped_reason=stopped_reason,
     )
     print(json.dumps(manifest, ensure_ascii=False, indent=2))
     return 0
@@ -408,6 +548,8 @@ def build_parser() -> argparse.ArgumentParser:
     run_parser.add_argument("--agent-bootstrap-timeout-s", type=float, default=None, help="Agent bootstrap timeout.")
     run_parser.add_argument("--agent-prompt-timeout-s", type=float, default=None, help="Agent prompt timeout.")
     run_parser.add_argument("--agent-reasoning-enabled", action="store_true", help="Enable reasoning when bootstrapping and prompting the agent.")
+    run_parser.add_argument("--chunk-verification-enabled", action="store_true", help="Run teacher-provided verifier checks after each chunk execution.")
+    run_parser.add_argument("--chunk-verification-timeout-s", type=float, default=None, help="Timeout for post-chunk verification execution.")
     run_parser.add_argument("--skip-bootstrap", action="store_true", help="Skip qwen-computer-use-agent --model-id bootstrap and only send --prompt.")
     run_parser.add_argument("--output-dir", default=None, help="Directory that will receive generated datasets.")
     run_parser.add_argument("--session-outcome", type=_session_outcome_arg, default=None, help="Optional manual session label.")
