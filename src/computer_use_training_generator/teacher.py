@@ -56,6 +56,8 @@ Requirements:
 - If the task is about a Windows desktop or Windows software install, use Windows-oriented chunk prompts and Windows-friendly verifier checks.
 - For Windows software installation tasks, prefer the official `.exe` installer build, not `.zip`, portable, or archive downloads unless the task explicitly asks for those formats.
 - For Windows installer download chunks, state explicitly in `agent_prompt` that the agent must download the installer `.exe` and must avoid `.zip` or archive builds.
+- For general GUI operation tasks after installation, continue from the current desktop/app state instead of restarting setup or redownloading software unless the task explicitly asks for it.
+- For general GUI operation tasks, prefer prompts and verifiers that reflect the intended app state, open window/process, created file, or changed project/workspace state.
 - Do not emit Linux or macOS verification paths unless the task explicitly requires those platforms.
 
 Overall task:
@@ -147,14 +149,29 @@ def _normalize_windows_installer_agent_prompt(*, title: str, agent_prompt: str) 
     combined = f"{title}\n{raw}".lower()
     normalized = raw
     if "windows" in combined and ".exe" in combined and any(keyword in combined for keyword in ("download", "다운로드")):
-        reuse_hint = "이미 Downloads 폴더에 사용할 수 있는 DBeaver Windows installer `.exe`가 있으면 새로 받지 말고 그 파일을 그대로 사용해도 됩니다."
+        reuse_hint = "이미 Downloads 폴더에 사용할 수 있는 Windows installer `.exe`가 있으면 새로 받지 말고 그 파일을 그대로 사용해도 됩니다."
         if reuse_hint not in normalized:
             normalized = f"{normalized}\n\n{reuse_hint}"
     if "windows" in combined and ".exe" in combined and any(keyword in combined for keyword in ("install", "설치")):
-        install_hint = "Downloads 폴더에서 가장 최근의 DBeaver installer `.exe`를 찾아 실행하세요."
+        install_hint = "Downloads 폴더에서 가장 최근의 installer `.exe`를 찾아 실행하세요."
         if install_hint not in normalized:
             normalized = f"{install_hint}\n\n{normalized}"
     return normalized
+
+
+def _normalize_general_gui_agent_prompt(*, title: str, agent_prompt: str) -> str:
+    raw = str(agent_prompt or "").strip()
+    if not raw:
+        return raw
+    combined = f"{title}\n{raw}".lower()
+    if any(keyword in combined for keyword in ("download", "다운로드", "installer", ".exe", "setup", "설치")):
+        return raw
+    if not any(keyword in combined for keyword in ("open", "launch", "create", "click", "project", "window", "menu", "dialog", "파일", "열", "실행", "생성", "프로젝트", "창", "메뉴")):
+        return raw
+    continue_hint = "현재 앱이나 창이 이미 열려 있으면 그 상태를 이어서 사용하고, 작업과 무관한 재설치나 재다운로드는 하지 마세요."
+    if continue_hint in raw:
+        return raw
+    return f"{raw}\n\n{continue_hint}"
 
 
 def _run_teacher_command(*, prompt: str, command_template: str, cwd: str | None, timeout_s: float):
@@ -209,6 +226,7 @@ def _normalize_chunks(payload: dict, *, source_task: str, source_text: str) -> l
         chunk_id = str(item.get("chunk_id") or f"chunk-{index:03d}").strip() or f"chunk-{index:03d}"
         title = str(item.get("title") or f"Chunk {index}").strip() or f"Chunk {index}"
         agent_prompt = _normalize_windows_installer_agent_prompt(title=title, agent_prompt=agent_prompt)
+        agent_prompt = _normalize_general_gui_agent_prompt(title=title, agent_prompt=agent_prompt)
         success_hint = str(item.get("success_hint") or "").strip() or None
         preconditions = [str(value).strip() for value in item.get("preconditions", []) if str(value).strip()] if isinstance(item.get("preconditions"), list) else []
         raw_verification = item.get("verification")

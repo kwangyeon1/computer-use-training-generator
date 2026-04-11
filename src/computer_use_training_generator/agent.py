@@ -8,9 +8,10 @@ import uuid
 from .models import AgentInvocationResult
 from .subprocess_utils import command_to_shell_string, run_command
 
-_RAW_AGENT_STATE_DIR = Path("/tmp/computer_use_raw_python_agent")
-_RAW_AGENT_REQUESTS_DIR = _RAW_AGENT_STATE_DIR / "requests"
-_RAW_AGENT_RESPONSES_DIR = _RAW_AGENT_STATE_DIR / "responses"
+_RAW_AGENT_STATE_DIRS = {
+    "computer-use-raw-python-agent": Path("/tmp/computer_use_raw_python_agent"),
+    "qwen-computer-use-agent": Path("/tmp/computer_use_raw_python_agent_qwen35"),
+}
 
 
 def _parse_agent_json(stdout: str) -> dict:
@@ -59,16 +60,25 @@ def _base_agent_command(
 
 def _is_raw_agent_command(agent_command: str) -> bool:
     name = Path(str(agent_command or "")).name
-    return name == "computer-use-raw-python-agent"
+    return name in _RAW_AGENT_STATE_DIRS
 
 
 def _send_raw_agent_daemon_request(payload: dict, *, timeout_s: float) -> dict:
+    return _send_named_agent_daemon_request("computer-use-raw-python-agent", payload, timeout_s=timeout_s)
+
+
+def _send_named_agent_daemon_request(agent_command: str, payload: dict, *, timeout_s: float) -> dict:
+    state_dir = _RAW_AGENT_STATE_DIRS.get(Path(str(agent_command or "")).name)
+    if state_dir is None:
+        raise RuntimeError(f"agent daemon path is not configured for command: {agent_command}")
     request_id = uuid.uuid4().hex
-    _RAW_AGENT_REQUESTS_DIR.mkdir(parents=True, exist_ok=True)
-    _RAW_AGENT_RESPONSES_DIR.mkdir(parents=True, exist_ok=True)
-    request_path = _RAW_AGENT_REQUESTS_DIR / f"{request_id}.json"
-    response_path = _RAW_AGENT_RESPONSES_DIR / f"{request_id}.json"
-    temp_path = _RAW_AGENT_REQUESTS_DIR / f"{request_id}.tmp"
+    requests_dir = state_dir / "requests"
+    responses_dir = state_dir / "responses"
+    requests_dir.mkdir(parents=True, exist_ok=True)
+    responses_dir.mkdir(parents=True, exist_ok=True)
+    request_path = requests_dir / f"{request_id}.json"
+    response_path = responses_dir / f"{request_id}.json"
+    temp_path = requests_dir / f"{request_id}.tmp"
     temp_path.write_text(json.dumps(payload, ensure_ascii=False, indent=2), encoding="utf-8")
     temp_path.replace(request_path)
 
@@ -132,7 +142,8 @@ def run_agent_prompt(
     command.extend(["--prompt", prompt])
     if _is_raw_agent_command(agent_command):
         started = time.monotonic()
-        response = _send_raw_agent_daemon_request(
+        response = _send_named_agent_daemon_request(
+            agent_command,
             {
                 "action": "run",
                 "prompt": prompt,
