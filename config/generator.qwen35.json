@@ -1,0 +1,19 @@
+{
+  "teacher_command_template": "codex exec -m gpt-5.4-mini -c model_reasoning_effort=\"low\" \"{prompt}\"",
+  "teacher_timeout_s": 600,
+  "teacher_split_enabled": true,
+  "teacher_split_timeout_s": 600,
+  "teacher_workdir": "..",
+  "teacher_task_context": "You are planning actions for a remote Windows desktop controlled by a computer-use agent through an executor endpoint. Do not answer based on your own local Codex CLI sandbox limitations. Assume the agent can control GUI apps, browsers, files, downloads, installers, and subprocesses on the target Windows machine. Provide actionable guidance for that target Windows machine only. For software installation tasks, prefer official vendor sources and prefer the official Windows installer .exe, not zip or portable archive builds, unless the task explicitly requests another format. Produce steps that can verify download completion and installation success on Windows.",
+  "chunk_verification_enabled": true,
+  "chunk_verification_timeout_s": 60,
+  "agent_command": "../../computer-use-raw-python-agent/.venv/bin/qwen-computer-use-agent",
+  "agent_model_id": "",
+  "agent_config_path": "../../computer-use-raw-python-agent/config/agent.qwen35.default.json",
+  "agent_endpoint": "http://127.0.0.1:8790",
+  "agent_reasoning_enabled": true,
+  "agent_workdir": "../../computer-use-raw-python-agent",
+  "agent_bootstrap_timeout_s": 600,
+  "agent_prompt_timeout_s": 1800,
+  "output_dir": "../data/sessions"
+}
