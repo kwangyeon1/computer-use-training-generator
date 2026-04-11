@@ -20,7 +20,7 @@ from .collector import (
 )
 from .config_utils import load_generator_config
 from .models import TeacherChunkPlanResult, TeacherTaskChunk
-from .teacher import run_teacher, split_teacher_response
+from .teacher import build_local_teacher_fallback, run_teacher, split_teacher_response
 from .verification import run_chunk_verification, write_verification_artifact
 
 
@@ -112,7 +112,10 @@ def _serialize_chunk(chunk: TeacherTaskChunk) -> dict:
 
 
 def _compose_chunk_prompt(chunk: TeacherTaskChunk) -> str:
-    parts = [chunk.agent_prompt.strip()]
+    parts = [
+        "Return executable Python only for this chunk. Do not ask a human to perform manual GUI actions outside the generated Python.",
+        chunk.agent_prompt.strip(),
+    ]
     if chunk.success_hint:
         parts.append(f"Current chunk success target: {chunk.success_hint}")
     if chunk.preconditions:
@@ -267,41 +270,51 @@ $flags = $SWP_NOMOVE -bor $SWP_NOSIZE -bor $SWP_SHOWWINDOW -bor $SWP_NOACTIVATE
 def cmd_run_session(args: argparse.Namespace) -> int:
     config, _ = _build_effective_config(args)
     teacher_prompt = args.teacher_prompt or _compose_teacher_prompt(task=args.task, config=config)
-
-    teacher_result = run_teacher(
-        prompt=teacher_prompt,
-        command_template=str(config.get("teacher_command_template", "")),
-        cwd=config.get("teacher_workdir"),
-        timeout_s=float(config.get("teacher_timeout_s", 300)),
-    )
-
+    teacher_command_template = str(config.get("teacher_command_template", ""))
+    teacher_workdir = config.get("teacher_workdir")
+    teacher_timeout_s = float(config.get("teacher_timeout_s", 300))
     teacher_split_enabled = bool(config.get("teacher_split_enabled", True))
-    if teacher_split_enabled:
-        teacher_plan = split_teacher_response(
-            task=args.task,
-            teacher_text=teacher_result.response_text,
-            command_template=str(config.get("teacher_command_template", "")),
-            cwd=config.get("teacher_workdir"),
-            timeout_s=float(config.get("teacher_split_timeout_s", config.get("teacher_timeout_s", 300))),
+    try:
+        teacher_result = run_teacher(
+            prompt=teacher_prompt,
+            command_template=teacher_command_template,
+            cwd=teacher_workdir,
+            timeout_s=teacher_timeout_s,
         )
-    else:
-        teacher_plan = TeacherChunkPlanResult(
-            source_task=args.task,
-            source_text=teacher_result.response_text,
-            chunks=[
-                TeacherTaskChunk(
-                    chunk_id="chunk-001",
-                    title=args.task,
-                    agent_prompt=teacher_result.response_text,
-                    success_hint=None,
-                    preconditions=[],
-                    verification=None,
-                    max_retries=0,
-                    on_fail="fail_session",
-                    notes=["teacher_split_disabled"],
-                )
-            ],
-            command_result=teacher_result.command_result,
+        if teacher_split_enabled:
+            teacher_plan = split_teacher_response(
+                task=args.task,
+                teacher_text=teacher_result.response_text,
+                command_template=teacher_command_template,
+                cwd=teacher_workdir,
+                timeout_s=float(config.get("teacher_split_timeout_s", teacher_timeout_s)),
+            )
+        else:
+            teacher_plan = TeacherChunkPlanResult(
+                source_task=args.task,
+                source_text=teacher_result.response_text,
+                chunks=[
+                    TeacherTaskChunk(
+                        chunk_id="chunk-001",
+                        title=args.task,
+                        agent_prompt=teacher_result.response_text,
+                        success_hint=None,
+                        preconditions=[],
+                        verification=None,
+                        max_retries=0,
+                        on_fail="fail_session",
+                        notes=["teacher_split_disabled"],
+                    )
+                ],
+                command_result=teacher_result.command_result,
+            )
+    except Exception as exc:
+        teacher_result, teacher_plan = build_local_teacher_fallback(
+            task=args.task,
+            prompt=teacher_prompt,
+            command_template=teacher_command_template,
+            cwd=teacher_workdir,
+            error=str(exc),
         )
 
     session_id, session_root = prepare_session_root(output_dir=str(config["output_dir"]), task=args.task)
