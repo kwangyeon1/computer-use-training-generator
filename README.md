@@ -136,6 +136,152 @@ cd /home/kss930/model-projects/gui-owl-8B-think-1.0.0/computer-use-training-gene
 
 template 안에 `{prompt}`가 없으면 마지막 인자로 teacher prompt를 자동으로 붙입니다.
 
+## CLI 사용법
+
+기본 형태:
+
+```bash
+/home/kss930/model-projects/gui-owl-8B-think-1.0.0/.venv/bin/training-generator \
+  --config config/generator.default.json \
+  run-session \
+  --task "작업 설명"
+```
+
+config 없이 실행하면 현재 작업 디렉터리 기준 `config/generator.default.json`을 찾습니다.
+
+### `run-session`
+
+teacher -> agent -> verifier -> dataset 수집 전체 흐름을 한 번에 실행합니다.
+
+핵심 옵션:
+
+- `--task`
+  - 필수값입니다.
+  - teacher에 전달할 실제 작업 설명입니다.
+- `--teacher-prompt`
+  - teacher에 보낼 문구를 `--task`와 다르게 따로 지정할 때 씁니다.
+- `--teacher-command-template`
+  - 외부 teacher CLI 템플릿입니다.
+  - `{prompt}` placeholder를 넣을 수 있습니다.
+- `--teacher-timeout-s`
+  - teacher 자연어 응답 생성 timeout입니다.
+- `--teacher-workdir`
+  - teacher CLI를 실행할 작업 디렉터리입니다.
+- `--teacher-split-enabled`
+  - teacher 원문 응답을 다시 순차 chunk JSON으로 분할하게 강제합니다.
+  - config에서 이미 켜져 있으면 보통 다시 줄 필요는 없습니다.
+- `--teacher-split-timeout-s`
+  - teacher 분할 단계 timeout입니다.
+- `--agent-command`
+  - 사용할 agent CLI 경로 또는 이름입니다.
+  - 현재는 `computer-use-raw-python-agent`, `qwen-computer-use-agent` 모두 지원합니다.
+- `--agent-model-id`
+  - bootstrap 시 agent에 넘길 모델 식별자입니다.
+  - 이미 daemon이 떠 있는 raw agent 흐름에서는 보통 쓰지 않습니다.
+- `--agent-config-path`
+  - agent에 넘길 config JSON 경로입니다.
+- `--agent-endpoint`
+  - executor endpoint입니다.
+- `--agent-workdir`
+  - agent CLI를 실행할 작업 디렉터리입니다.
+- `--agent-bootstrap-timeout-s`
+  - agent bootstrap timeout입니다.
+- `--agent-prompt-timeout-s`
+  - 각 chunk의 agent 실행 timeout입니다.
+- `--agent-reasoning-enabled`
+  - bootstrap/prompt 호출 때 reasoning 플래그를 켭니다.
+- `--chunk-verification-enabled`
+  - chunk 실행 후 teacher verifier를 강제로 돌립니다.
+  - config에서 켜져 있으면 보통 다시 줄 필요는 없습니다.
+- `--chunk-verification-timeout-s`
+  - verifier timeout입니다.
+- `--skip-bootstrap`
+  - agent의 `--model-id` bootstrap 호출을 생략합니다.
+  - 이미 daemon을 띄워둔 `computer-use-raw-python-agent`, `qwen-computer-use-agent` 재사용 흐름에서는 이 옵션을 붙이는 것이 맞습니다.
+- `--output-dir`
+  - 세션 결과를 저장할 루트 디렉터리입니다.
+- `--session-outcome`
+  - 세션 완료 후 수동 라벨을 `success`, `fail`, `unknown` 중 하나로 지정합니다.
+- `--session-note`
+  - 세션에 짧은 메모를 남깁니다.
+- `--include-unexecuted-steps`
+  - executor 산출물이 없는 step도 dataset에 포함합니다.
+
+예시 1: Codex teacher + 이미 띄워둔 raw agent daemon 재사용
+
+```bash
+PYTHONPATH=src /home/kss930/model-projects/gui-owl-8B-think-1.0.0/.venv/bin/python \
+  -m computer_use_training_generator.cli \
+  --config config/generator.codex.gpt54.json \
+  run-session \
+  --task "dbeaver를 설치해줘" \
+  --skip-bootstrap
+```
+
+예시 2: Qwen agent daemon 재사용
+
+```bash
+PYTHONPATH=src /home/kss930/model-projects/gui-owl-8B-think-1.0.0/.venv/bin/python \
+  -m computer_use_training_generator.cli \
+  --config config/generator.qwen35.json \
+  run-session \
+  --task "eclipse를 설치하고 새 Java 프로젝트를 만들어줘" \
+  --skip-bootstrap
+```
+
+예시 3: config 일부만 CLI에서 override
+
+```bash
+PYTHONPATH=src /home/kss930/model-projects/gui-owl-8B-think-1.0.0/.venv/bin/python \
+  -m computer_use_training_generator.cli \
+  --config config/generator.default.json \
+  run-session \
+  --task "카카오톡을 설치해줘" \
+  --teacher-command-template 'codex exec -m gpt-5.4-mini "{prompt}"' \
+  --agent-command ../../computer-use-raw-python-agent/.venv/bin/qwen-computer-use-agent \
+  --agent-config-path ../../computer-use-raw-python-agent/config/agent.qwen35.default.json \
+  --agent-workdir ../../computer-use-raw-python-agent \
+  --skip-bootstrap
+```
+
+### `collect-run`
+
+이미 만들어진 agent run 디렉터리를 dataset으로만 재수집합니다.
+teacher/agent를 다시 실행하지 않고 산출물 변환만 다시 할 때 씁니다.
+
+옵션:
+
+- `--run-dir`
+  - 필수값입니다.
+  - 기존 agent run 디렉터리 경로입니다.
+- `--task`
+  - 필수값입니다.
+  - 이 run에 대응하는 상위 작업 설명입니다.
+- `--teacher-prompt`
+  - 원래 teacher에 넣었던 프롬프트를 기록용으로 남깁니다.
+- `--teacher-text`
+  - teacher 원문 응답을 직접 문자열로 넘깁니다.
+- `--teacher-text-file`
+  - teacher 원문 응답 파일 경로입니다.
+- `--output-dir`
+  - 수집 결과 저장 루트입니다.
+- `--session-outcome`
+  - 세션 라벨을 수동 지정합니다.
+- `--session-note`
+  - 세션 메모를 남깁니다.
+- `--include-unexecuted-steps`
+  - executor 산출물이 없는 step도 포함합니다.
+
+예시:
+
+```bash
+/home/kss930/model-projects/gui-owl-8B-think-1.0.0/.venv/bin/training-generator \
+  collect-run \
+  --run-dir /path/to/agent/run-dir \
+  --task "dbeaver를 설치해줘" \
+  --teacher-text-file /path/to/teacher.txt
+```
+
 ## teacher 분할
 
 기본값으로 `run-session`은 teacher 원문을 다시 teacher에게 넣어 순차 chunk JSON으로 분할합니다.

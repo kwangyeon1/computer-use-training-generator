@@ -139,6 +139,13 @@ def _chunk_completed_from_agent_payload(payload: dict) -> bool:
     return bool(final_response.get("done")) or str(summary.get("stopped_reason") or "") == "task_completed"
 
 
+def _compose_teacher_prompt(*, task: str, config: dict) -> str:
+    context = str(config.get("teacher_task_context") or "").strip()
+    if not context:
+        return task
+    return f"{context}\n\nActual task for the target machine:\n{task.strip()}"
+
+
 def _request_terminal_attention(message: str) -> None:
     stream = sys.stderr if sys.stderr.isatty() else None
     owned_stream = None
@@ -259,7 +266,7 @@ $flags = $SWP_NOMOVE -bor $SWP_NOSIZE -bor $SWP_SHOWWINDOW -bor $SWP_NOACTIVATE
 
 def cmd_run_session(args: argparse.Namespace) -> int:
     config, _ = _build_effective_config(args)
-    teacher_prompt = args.teacher_prompt or args.task
+    teacher_prompt = args.teacher_prompt or _compose_teacher_prompt(task=args.task, config=config)
 
     teacher_result = run_teacher(
         prompt=teacher_prompt,
@@ -353,7 +360,29 @@ def cmd_run_session(args: argparse.Namespace) -> int:
         final_run_label: str | None = None
         final_run_dir: str | None = None
         attempts_used = 0
+        if chunk_verification_enabled:
+            precheck_label = f"chunk-{chunk_index:03d}.precheck"
+            precheck_result_obj = run_chunk_verification(
+                endpoint=config.get("agent_endpoint"),
+                timeout_s=float(config.get("chunk_verification_timeout_s", 60)),
+                session_id=session_id,
+                agent_run_label=precheck_label,
+                chunk=chunk,
+            )
+            if precheck_result_obj is not None:
+                write_verification_artifact(
+                    session_root=session_root,
+                    agent_run_label=precheck_label,
+                    result=precheck_result_obj,
+                )
+                precheck_payload = asdict(precheck_result_obj)
+                final_verification_result = precheck_payload
+                if bool(precheck_payload.get("passed")):
+                    chunk_completed = True
+                    final_run_label = precheck_label
         while True:
+            if chunk_completed:
+                break
             attempts_used += 1
             prompt_text = _compose_chunk_prompt(chunk)
             if attempt_index > 0 and final_verification_result is not None:
