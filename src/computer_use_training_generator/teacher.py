@@ -44,11 +44,19 @@ Requirements:
 - If the original answer contains official URLs or important warnings, keep them in the relevant chunk prompt.
 - Each chunk must include a read-only verification plan.
 - Verification must use only the allowed check kinds: `path_exists`, `file_exists_glob`, `file_size_gt`, `process_exists`.
+- All verification checks are combined with logical AND.
+- If you need to allow multiple possible installer filenames, use one broad glob that matches all acceptable names instead of multiple alternative checks.
+- For Windows installer download chunks, prefer a broad `.exe` glob such as `~/Downloads/*vendor*.exe` instead of a brittle pattern that requires exact words like `installer` or `setup`.
 - Do not output raw Python for verification.
 - `preconditions` should describe what must already be true before the chunk starts.
 - `max_retries` should be a small integer, usually 0, 1, or 2.
 - `on_fail` must be either `retry_current_chunk` or `fail_session`.
 - Do not add commentary outside JSON.
+- Plan for the target machine described by the task and teacher answer, not for your own CLI sandbox.
+- If the task is about a Windows desktop or Windows software install, use Windows-oriented chunk prompts and Windows-friendly verifier checks.
+- For Windows software installation tasks, prefer the official `.exe` installer build, not `.zip`, portable, or archive downloads unless the task explicitly asks for those formats.
+- For Windows installer download chunks, state explicitly in `agent_prompt` that the agent must download the installer `.exe` and must avoid `.zip` or archive builds.
+- Do not emit Linux or macOS verification paths unless the task explicitly requires those platforms.
 
 Overall task:
 {task}
@@ -56,6 +64,97 @@ Overall task:
 Teacher answer:
 {teacher_text}
 """
+
+_GENERIC_INSTALLER_TOKENS = {
+    "downloads",
+    "download",
+    "windows",
+    "window",
+    "win",
+    "installer",
+    "setup",
+    "latest",
+    "community",
+    "lite",
+    "x64",
+    "x86",
+    "x86_64",
+    "exe",
+}
+
+
+def _simplify_windows_installer_glob(pattern: str) -> str:
+    raw = str(pattern or "").strip()
+    lowered = raw.lower()
+    if not raw or not lowered.endswith(".exe"):
+        return raw
+    prefix, separator, filename = raw.rpartition("/")
+    filename_tokens = [
+        token
+        for token in re.split(r"[^a-z0-9]+", filename.lower())
+        if token and token not in _GENERIC_INSTALLER_TOKENS and not token.isdigit()
+    ]
+    if not filename_tokens:
+        return raw
+    deduped: list[str] = []
+    for token in filename_tokens:
+        if token not in deduped:
+            deduped.append(token)
+    vendor_tokens = deduped[:2]
+    vendor_glob = f"*{'*'.join(vendor_tokens)}*.exe"
+    return f"{prefix}{separator}{vendor_glob}" if separator else vendor_glob
+
+
+def _normalize_windows_installer_verification(
+    *,
+    title: str,
+    agent_prompt: str,
+    verification: dict | None,
+) -> dict | None:
+    if not isinstance(verification, dict):
+        return verification
+    combined = f"{title}\n{agent_prompt}".lower()
+    if "windows" not in combined or ".exe" not in combined:
+        return verification
+    if not any(keyword in combined for keyword in ("installer", "install", "설치", "download", "다운로드")):
+        return verification
+    checks = verification.get("checks")
+    if not isinstance(checks, list):
+        return verification
+    normalized_checks: list[dict] = []
+    changed = False
+    for item in checks:
+        if not isinstance(item, dict):
+            normalized_checks.append(item)
+            continue
+        updated = dict(item)
+        if str(updated.get("kind") or "").strip() == "file_exists_glob":
+            pattern = str(updated.get("pattern") or "").strip()
+            simplified = _simplify_windows_installer_glob(pattern)
+            if simplified and simplified != pattern:
+                updated["pattern"] = simplified
+                changed = True
+        normalized_checks.append(updated)
+    if not changed:
+        return verification
+    return {**verification, "checks": normalized_checks}
+
+
+def _normalize_windows_installer_agent_prompt(*, title: str, agent_prompt: str) -> str:
+    raw = str(agent_prompt or "").strip()
+    if not raw:
+        return raw
+    combined = f"{title}\n{raw}".lower()
+    normalized = raw
+    if "windows" in combined and ".exe" in combined and any(keyword in combined for keyword in ("download", "다운로드")):
+        reuse_hint = "이미 Downloads 폴더에 사용할 수 있는 DBeaver Windows installer `.exe`가 있으면 새로 받지 말고 그 파일을 그대로 사용해도 됩니다."
+        if reuse_hint not in normalized:
+            normalized = f"{normalized}\n\n{reuse_hint}"
+    if "windows" in combined and ".exe" in combined and any(keyword in combined for keyword in ("install", "설치")):
+        install_hint = "Downloads 폴더에서 가장 최근의 DBeaver installer `.exe`를 찾아 실행하세요."
+        if install_hint not in normalized:
+            normalized = f"{install_hint}\n\n{normalized}"
+    return normalized
 
 
 def _run_teacher_command(*, prompt: str, command_template: str, cwd: str | None, timeout_s: float):
@@ -109,10 +208,16 @@ def _normalize_chunks(payload: dict, *, source_task: str, source_text: str) -> l
             continue
         chunk_id = str(item.get("chunk_id") or f"chunk-{index:03d}").strip() or f"chunk-{index:03d}"
         title = str(item.get("title") or f"Chunk {index}").strip() or f"Chunk {index}"
+        agent_prompt = _normalize_windows_installer_agent_prompt(title=title, agent_prompt=agent_prompt)
         success_hint = str(item.get("success_hint") or "").strip() or None
         preconditions = [str(value).strip() for value in item.get("preconditions", []) if str(value).strip()] if isinstance(item.get("preconditions"), list) else []
         raw_verification = item.get("verification")
         verification = raw_verification if isinstance(raw_verification, dict) else None
+        verification = _normalize_windows_installer_verification(
+            title=title,
+            agent_prompt=agent_prompt,
+            verification=verification,
+        )
         raw_max_retries = item.get("max_retries")
         try:
             max_retries = int(raw_max_retries) if raw_max_retries is not None else (1 if verification else 0)

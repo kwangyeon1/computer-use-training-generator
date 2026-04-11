@@ -3,6 +3,8 @@ from __future__ import annotations
 from dataclasses import asdict
 import json
 from pathlib import Path
+import re
+import time
 from typing import Any
 import urllib.error
 import urllib.request
@@ -16,6 +18,9 @@ _ALLOWED_CHECK_KINDS = {
     "file_size_gt",
     "process_exists",
 }
+
+_VERIFICATION_RETRY_DELAY_S = 2.0
+_VERIFICATION_RETRY_COUNT = 5
 
 
 def _strip_screenshot_base64(value: Any) -> Any:
@@ -70,6 +75,72 @@ def _normalize_verification_spec(verification: dict[str, object] | None) -> dict
     return {"checks": checks}
 
 
+def _expanded_glob_patterns(pattern: str) -> list[str]:
+    raw = str(pattern or "").strip()
+    if not raw:
+        return []
+    patterns = [raw]
+    lowered = raw.lower()
+
+    def _append(candidate: str) -> None:
+        if candidate and candidate not in patterns:
+            patterns.append(candidate)
+
+    def _collapse_stars(candidate: str) -> str:
+        return re.sub(r"\*+", "*", candidate)
+
+    if lowered.endswith("-windows-x86_64.exe"):
+        suffix = raw[-len("-windows-x86_64.exe") :]
+        base = raw[: -len(suffix)]
+        _append(f"{base}-x86_64-setup.exe")
+        _append(f"{base}-x86_64-installer.exe")
+        _append(f"{base}-setup.exe")
+        _append(f"{base}-installer.exe")
+    elif lowered.endswith("-windows.exe"):
+        suffix = raw[-len("-windows.exe") :]
+        base = raw[: -len(suffix)]
+        _append(f"{base}-setup.exe")
+        _append(f"{base}-installer.exe")
+
+    if lowered.endswith(".exe"):
+        installer_alias = re.sub("installer", "setup", raw, flags=re.IGNORECASE)
+        setup_alias = re.sub("setup", "installer", raw, flags=re.IGNORECASE)
+        if installer_alias != raw:
+            _append(_collapse_stars(installer_alias))
+        if setup_alias != raw:
+            _append(_collapse_stars(setup_alias))
+        relaxed = raw
+        for token_pattern in (
+            r"\*windows\*installer\*",
+            r"\*windows\*setup\*",
+            r"\*win\*installer\*",
+            r"\*win\*setup\*",
+            r"\*installer\*",
+            r"\*setup\*",
+            r"\*windows\*",
+            r"\*win\*",
+        ):
+            candidate = re.sub(token_pattern, "*", raw, flags=re.IGNORECASE)
+            if candidate != raw:
+                _append(_collapse_stars(candidate))
+                relaxed = candidate
+        if "installer" in lowered or "setup" in lowered or "windows" in lowered or "win" in lowered:
+            _append(_collapse_stars(relaxed))
+
+    return patterns
+
+
+def _has_file_based_checks(verification: dict[str, object] | None) -> bool:
+    normalized = _normalize_verification_spec(verification)
+    if normalized is None:
+        return False
+    for check in normalized["checks"]:
+        kind = str(check.get("kind") or "").strip()
+        if kind in {"file_exists_glob", "file_size_gt"}:
+            return True
+    return False
+
+
 def build_verification_code(verification: dict[str, object] | None) -> str | None:
     normalized = _normalize_verification_spec(verification)
     if normalized is None:
@@ -79,13 +150,70 @@ def build_verification_code(verification: dict[str, object] | None) -> str | Non
 import json
 import os
 from pathlib import Path
+import re
 import subprocess
 
 CHECKS = json.loads({checks_json!r})
 
 
 def _glob_paths(pattern):
-    return sorted(glob.glob(os.path.expanduser(pattern), recursive=True))
+    expanded = _expanded_glob_patterns(pattern)
+    matches = []
+    for candidate in expanded:
+        for path in sorted(glob.glob(os.path.expanduser(candidate), recursive=True)):
+            if path not in matches:
+                matches.append(path)
+    return expanded, matches
+
+
+def _expanded_glob_patterns(pattern):
+    raw = str(pattern or "").strip()
+    if not raw:
+        return []
+    patterns = [raw]
+    lowered = raw.lower()
+
+    def _append(candidate):
+        if candidate and candidate not in patterns:
+            patterns.append(candidate)
+
+    if lowered.endswith("-windows-x86_64.exe"):
+        suffix = raw[-len("-windows-x86_64.exe"):]
+        base = raw[:-len(suffix)]
+        _append(f"{{base}}-x86_64-setup.exe")
+        _append(f"{{base}}-x86_64-installer.exe")
+        _append(f"{{base}}-setup.exe")
+        _append(f"{{base}}-installer.exe")
+    elif lowered.endswith("-windows.exe"):
+        suffix = raw[-len("-windows.exe"):]
+        base = raw[:-len(suffix)]
+        _append(f"{{base}}-setup.exe")
+        _append(f"{{base}}-installer.exe")
+    if lowered.endswith(".exe"):
+        installer_alias = re.sub("installer", "setup", raw, flags=re.IGNORECASE)
+        setup_alias = re.sub("setup", "installer", raw, flags=re.IGNORECASE)
+        if installer_alias != raw:
+            _append(re.sub(r"\\*+", "*", installer_alias))
+        if setup_alias != raw:
+            _append(re.sub(r"\\*+", "*", setup_alias))
+        relaxed = raw
+        for token_pattern in (
+            r"\\*windows\\*installer\\*",
+            r"\\*windows\\*setup\\*",
+            r"\\*win\\*installer\\*",
+            r"\\*win\\*setup\\*",
+            r"\\*installer\\*",
+            r"\\*setup\\*",
+            r"\\*windows\\*",
+            r"\\*win\\*",
+        ):
+            candidate = re.sub(token_pattern, "*", raw, flags=re.IGNORECASE)
+            if candidate != raw:
+                _append(re.sub(r"\\*+", "*", candidate))
+                relaxed = candidate
+        if "installer" in lowered or "setup" in lowered or "windows" in lowered or "win" in lowered:
+            _append(re.sub(r"\\*+", "*", relaxed))
+    return patterns
 
 
 def _process_listing():
@@ -111,14 +239,15 @@ for check in CHECKS:
         entry["exists"] = ok
     elif kind == "file_exists_glob":
         pattern = str(check.get("pattern") or "")
-        matches = _glob_paths(pattern)
+        searched_patterns, matches = _glob_paths(pattern)
         ok = bool(matches)
         entry["pattern"] = pattern
+        entry["searched_patterns"] = searched_patterns
         entry["matches"] = matches
     elif kind == "file_size_gt":
         pattern = str(check.get("pattern") or "")
         threshold = int(check.get("bytes") or 0)
-        matches = _glob_paths(pattern)
+        searched_patterns, matches = _glob_paths(pattern)
         sizes = []
         for path in matches:
             try:
@@ -127,6 +256,7 @@ for check in CHECKS:
                 sizes.append({{"path": path, "bytes": None}})
         ok = any((item.get("bytes") or 0) > threshold for item in sizes)
         entry["pattern"] = pattern
+        entry["searched_patterns"] = searched_patterns
         entry["bytes"] = threshold
         entry["matches"] = sizes
     elif kind == "process_exists":
@@ -186,26 +316,15 @@ def write_verification_artifact(*, session_root: Path, agent_run_label: str, res
     path.write_text(json.dumps(asdict(result), ensure_ascii=False, indent=2), encoding="utf-8")
 
 
-def run_chunk_verification(
+def _run_verification_once(
     *,
-    endpoint: str | None,
+    endpoint: str,
     timeout_s: float,
     session_id: str,
     agent_run_label: str,
     chunk: TeacherTaskChunk,
-) -> ChunkVerificationResult | None:
-    verification_code = build_verification_code(chunk.verification)
-    if verification_code is None:
-        return None
-    if not endpoint:
-        return ChunkVerificationResult(
-            verification=chunk.verification,
-            verification_code=verification_code,
-            passed=False,
-            return_code=None,
-            evidence=[],
-            error="agent_endpoint is required for chunk verification",
-        )
+    verification_code: str,
+) -> ChunkVerificationResult:
     try:
         payload = _executor_rpc(
             endpoint,
@@ -253,3 +372,50 @@ def run_chunk_verification(
         error=error,
         executor_payload=_strip_screenshot_base64(payload) if isinstance(payload, dict) else {},
     )
+
+
+def run_chunk_verification(
+    *,
+    endpoint: str | None,
+    timeout_s: float,
+    session_id: str,
+    agent_run_label: str,
+    chunk: TeacherTaskChunk,
+) -> ChunkVerificationResult | None:
+    verification_code = build_verification_code(chunk.verification)
+    if verification_code is None:
+        return None
+    if not endpoint:
+        return ChunkVerificationResult(
+            verification=chunk.verification,
+            verification_code=verification_code,
+            passed=False,
+            return_code=None,
+            evidence=[],
+            error="agent_endpoint is required for chunk verification",
+        )
+    result = _run_verification_once(
+        endpoint=str(endpoint),
+        timeout_s=float(timeout_s),
+        session_id=session_id,
+        agent_run_label=agent_run_label,
+        chunk=chunk,
+        verification_code=verification_code,
+    )
+    if result.passed or not _has_file_based_checks(chunk.verification):
+        return result
+    if result.return_code not in (None, 0):
+        return result
+    for _ in range(_VERIFICATION_RETRY_COUNT):
+        time.sleep(_VERIFICATION_RETRY_DELAY_S)
+        result = _run_verification_once(
+            endpoint=str(endpoint),
+            timeout_s=float(timeout_s),
+            session_id=session_id,
+            agent_run_label=agent_run_label,
+            chunk=chunk,
+            verification_code=verification_code,
+        )
+        if result.passed or result.return_code not in (None, 0):
+            break
+    return result
