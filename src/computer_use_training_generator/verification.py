@@ -101,6 +101,12 @@ def _expanded_glob_patterns(pattern: str) -> list[str]:
         base = raw[: -len(suffix)]
         _append(f"{base}-setup.exe")
         _append(f"{base}-installer.exe")
+    elif "-windows-*.exe" in lowered:
+        base = re.sub(r"-windows-\*\.exe$", "", raw, flags=re.IGNORECASE)
+        _append(f"{base}-x86_64-setup.exe")
+        _append(f"{base}-x86_64-installer.exe")
+        _append(f"{base}-setup.exe")
+        _append(f"{base}-installer.exe")
 
     if lowered.endswith(".exe"):
         installer_alias = re.sub("installer", "setup", raw, flags=re.IGNORECASE)
@@ -187,6 +193,12 @@ def _expanded_glob_patterns(pattern):
     elif lowered.endswith("-windows.exe"):
         suffix = raw[-len("-windows.exe"):]
         base = raw[:-len(suffix)]
+        _append(f"{{base}}-setup.exe")
+        _append(f"{{base}}-installer.exe")
+    elif "-windows-*.exe" in lowered:
+        base = re.sub(r"-windows-\\*\\.exe$", "", raw, flags=re.IGNORECASE)
+        _append(f"{{base}}-x86_64-setup.exe")
+        _append(f"{{base}}-x86_64-installer.exe")
         _append(f"{{base}}-setup.exe")
         _append(f"{{base}}-installer.exe")
     if lowered.endswith(".exe"):
