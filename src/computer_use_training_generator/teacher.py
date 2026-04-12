@@ -45,6 +45,7 @@ Requirements:
 - Do not rely on a human to manually click, type, confirm dialogs, or inspect pages outside the Python automation flow.
 - Use as many chunks as needed, but keep them compact and stage-focused.
 - If the original answer contains official URLs or important warnings, keep them in the relevant chunk prompt.
+- For software download/install chunks, include at least one exact official vendor or official release URL directly in `agent_prompt` whenever you know one from the task, teacher answer, or your own planning. Do not leave the agent to infer the base domain from product names alone.
 - Each chunk must include a read-only verification plan.
 - Verification must use only the allowed check kinds: `path_exists`, `file_exists_glob`, `file_size_gt`, `process_exists`.
 - All verification checks are combined with logical AND.
@@ -60,6 +61,7 @@ Requirements:
 - For Windows software installation tasks, prefer the official `.exe` installer build, not `.zip`, portable, or archive downloads unless the task explicitly asks for those formats.
 - For Windows installer download chunks, state explicitly in `agent_prompt` that the agent must download the installer `.exe` and must avoid `.zip` or archive builds.
 - For Windows installer download chunks, prefer deterministic Python-first flows: direct official URL discovery, Python download to `Downloads`, file-size/path verification, and Python-launched installer execution before browser-click-heavy flows.
+- For Windows installer download chunks, prefer prompts that name the exact official landing page or release page URL to fetch first, then instruct the agent to resolve relative or absolute `.exe` links from that page.
 - Only fall back to browser GUI navigation when a direct official installer URL cannot be determined from the teacher answer or current task context.
 - For general GUI operation tasks after installation, continue from the current desktop/app state instead of restarting setup or redownloading software unless the task explicitly asks for it.
 - For general GUI operation tasks, prefer prompts and verifiers that reflect the intended app state, open window/process, created file, or changed project/workspace state.
@@ -204,21 +206,23 @@ def _matching_installer_hint(*, source_task: str, title: str, agent_prompt: str,
 
 def _official_source_hint(*parts: str) -> str:
     keywords = _target_installer_keywords(*parts, limit=3)
-    lowered = " ".join(str(part or "").lower() for part in parts)
-    if "dbeaver" in lowered or "dbeaver" in keywords:
-        return (
-            "이 작업에서 확인할 수 있는 공식 source 후보는 `https://dbeaver.com/download/` 와 "
-            "`https://dbeaver.com/files/dbeaver-le-latest-x86_64-setup.exe` 와 "
-            "`https://github.com/dbeaver/dbeaver/releases/latest` 입니다. "
-            "DBeaver download page의 Windows Installer direct URL은 현재 "
-            "`https://dbeaver.com/files/dbeaver-le-latest-x86_64-setup.exe` 입니다. "
-            "현재 latest GitHub release tag는 `26.0.2`이며 Windows installer asset은 "
-            "`dbeaver-ce-26.0.2-x86_64-setup.exe` 형태입니다. "
-            "먼저 vendor direct installer URL을 시도하고, 실패하면 "
-            "`https://github.com/dbeaver/dbeaver/releases/download/26.0.2/dbeaver-ce-26.0.2-x86_64-setup.exe` "
-            "를 먼저 시도하고, 실패하면 release page HTML에서 최신 `.exe` asset을 다시 추출하세요."
-        )
-    return ""
+    if not keywords:
+        return ""
+    joined = ", ".join(f"`{keyword}`" for keyword in keywords)
+    return (
+        f"공식 source는 작업과 일치하는 vendor site, official download page, official docs, official release page만 사용하세요. "
+        f"가능하면 {joined} 같은 대상 앱 키워드가 포함된 공식 Windows installer `.exe`를 우선 찾으세요. "
+        "한 공식 페이지에서 raw installer 링크를 찾지 못해도 하드코딩된 버전 번호나 추측한 파일명으로 점프하지 말고, "
+        "다른 공식 페이지나 공식 release 페이지 HTML에서 최신 `.exe` asset을 다시 추출하세요."
+    )
+
+
+def _likely_install_path_hint(keyword: str) -> str:
+    target = re.sub(r"[^A-Za-z0-9]+", "", str(keyword or "")).strip() or "TargetApp"
+    return (
+        f"%LOCALAPPDATA%\\\\{target}, %LOCALAPPDATA%\\\\Programs\\\\{target}, "
+        f"%ProgramFiles%\\\\{target}, %ProgramFiles(x86)%\\\\{target}"
+    )
 
 
 def _simplify_windows_installer_glob(pattern: str) -> str:
@@ -295,7 +299,11 @@ def _normalize_windows_installer_agent_prompt(
         "이 chunk는 실행 가능한 Python 코드만으로 수행하세요. "
         "다운로드는 curl, wget, powershell, http.server 같은 외부 도구 대신 Python HTTP와 파일 I/O를 사용하세요. "
         "Windows 사용자 폴더 경로는 %USERPROFILE% 문자열을 그대로 쓰지 말고 os.environ, os.path.expandvars, Path.home() 등으로 실제 경로를 해석하세요. "
+        "chunk prompt 안에 공식 vendor URL이 이미 있으면 그 exact URL부터 먼저 fetch하고, 비슷해 보이는 다른 host나 guessed latest path로 바꾸지 마세요. "
         "공식 landing page에 raw installer 링크가 바로 없으면 같은 스크립트 안에서 다른 공식 페이지나 공식 release 페이지도 확인하세요. "
+        "공식 HTML에서 실제로 확인하지 않은 `/files/latest`, `/download/latest` 같은 guessed artifact 디렉터리를 HTML page처럼 바로 열지 마세요. "
+        "공식 HTML의 relative href/src 링크는 urllib.parse.urljoin 으로 base page에 대해 절대 URL로 변환해서 검사하세요. "
+        "installer 링크가 버전 숫자를 포함한다고 가정하지 말고, relative 또는 absolute official `.exe` 링크를 넓게 수집한 뒤 HTTP 요청으로 검증하세요. "
         "HTML에서는 href만 보지 말고 absolute https .exe URL 후보도 찾고, 선택한 URL은 실제 HTTP 요청으로 검증하세요. "
         "다운로드나 설치가 실패하면 예외를 발생시키거나 non-zero로 종료하세요."
     )
@@ -395,6 +403,7 @@ def _local_install_chunks(task: str, *, execution_style: str = "python_first") -
     keyword = (_target_installer_keywords(task, limit=1) or ["targetapp"])[0]
     downloads_subdir = keyword.capitalize()
     installed_exe_glob = f"~/AppData/Local/**/*{keyword}*/{keyword}.exe"
+    likely_install_paths = _likely_install_path_hint(keyword)
     download_title = f"Download {keyword} installer"
     install_title = f"Install {keyword}"
     launch_title = f"Launch {keyword}"
@@ -409,7 +418,7 @@ def _local_install_chunks(task: str, *, execution_style: str = "python_first") -
             f"Use executable Python only. Do not download anything in this chunk. "
             f"First inspect the current screenshot and desktop state for an installer wizard, UAC prompt, license dialog, destination dialog, or completion dialog, and drive that visible UI forward if present. "
             f"Launching only the final app executable is not enough for this chunk. If no installer UI is visible yet, find the existing installer `.exe` in `%USERPROFILE%\\\\Downloads\\\\{downloads_subdir}\\\\`, launch it once, and then continue from the resulting installer UI. "
-            f"Only after installer progression should you check likely install directories such as `%LOCALAPPDATA%\\\\DBeaver`, `%LOCALAPPDATA%\\\\Programs\\\\DBeaver`, `%ProgramFiles%\\\\DBeaver`, and `%ProgramFiles(x86)%\\\\DBeaver` for `{keyword}.exe`. Avoid recursively scanning the whole of `%LOCALAPPDATA%` or `%ProgramFiles%`. "
+            f"Only after installer progression should you check likely install directories such as `{likely_install_paths}` for `{keyword}.exe`. Avoid recursively scanning the whole of `%LOCALAPPDATA%` or `%ProgramFiles%`. "
             f"Do not import `pywin32`, `pywinauto`, `win32gui`, `win32con`, `win32api`, or `pythoncom`. Prefer the standard library, `psutil`, `pyautogui`, and `pygetwindow` only if clearly needed. "
             f"Fail explicitly if no valid installer is found or if the install still has not produced the app executable. End only when the installed app `.exe` exists on disk."
         )
@@ -424,7 +433,7 @@ def _local_install_chunks(task: str, *, execution_style: str = "python_first") -
             f"Use executable Python only. Do not download anything in this chunk. "
             f"First inspect the current screenshot and desktop state for an installer wizard, UAC prompt, license dialog, destination dialog, or completion dialog, and drive that UI forward if it is visible. "
             f"Launching only the final app executable is not enough for this chunk. If the app is not already installed, the script must either launch the installer `.exe` itself or operate a visible installer window with Python GUI automation. "
-            f"If no installer UI is visible, find the existing installer `.exe` in `%USERPROFILE%\\\\Downloads\\\\{downloads_subdir}\\\\`, launch it once, wait long enough for setup to appear or continue, and then check only likely install directories such as `%LOCALAPPDATA%\\\\DBeaver`, `%LOCALAPPDATA%\\\\Programs\\\\DBeaver`, `%ProgramFiles%\\\\DBeaver`, and `%ProgramFiles(x86)%\\\\DBeaver` for `{keyword}.exe`. Avoid recursively scanning the whole of `%LOCALAPPDATA%` or `%ProgramFiles%`. "
+            f"If no installer UI is visible, find the existing installer `.exe` in `%USERPROFILE%\\\\Downloads\\\\{downloads_subdir}\\\\`, launch it once, wait long enough for setup to appear or continue, and then check only likely install directories such as `{likely_install_paths}` for `{keyword}.exe`. Avoid recursively scanning the whole of `%LOCALAPPDATA%` or `%ProgramFiles%`. "
             f"Do not import `pywin32`, `pywinauto`, `win32gui`, `win32con`, `win32api`, or `pythoncom`. Prefer the standard library, `psutil`, `pyautogui`, and `pygetwindow` only if clearly needed. "
             f"Fail explicitly if no valid installer is found or if the install still has not produced the app executable. End only when the installed app `.exe` exists on disk."
         )

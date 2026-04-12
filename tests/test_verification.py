@@ -82,8 +82,8 @@ def test_normalize_windows_installer_agent_prompt_adds_reuse_hint() -> None:
     assert "os.environ" in prompt
     assert "다른 공식 페이지나 공식 release 페이지도 확인" in prompt
     assert "absolute https .exe URL 후보" in prompt
-    assert "https://dbeaver.com/download/" in prompt
-    assert "https://github.com/dbeaver/dbeaver/releases/latest" in prompt
+    assert "공식 source는 작업과 일치하는 vendor site" in prompt
+    assert "하드코딩된 버전 번호나 추측한 파일명으로 점프하지 말고" in prompt
     assert "이미 Downloads 폴더에 사용할 수 있는 대상 앱의 Windows installer" in prompt
 
 
@@ -187,7 +187,7 @@ def test_build_local_teacher_fallback_for_install_task_produces_python_first_chu
     assert "Do not download anything in this chunk." in teacher_plan.chunks[1].agent_prompt
     assert "Launching only the final app executable is not enough for this chunk." in teacher_plan.chunks[1].agent_prompt
     assert "Avoid recursively scanning the whole of `%LOCALAPPDATA%` or `%ProgramFiles%`." in teacher_plan.chunks[1].agent_prompt
-    assert "%LOCALAPPDATA%\\\\Programs\\\\DBeaver" in teacher_plan.chunks[1].agent_prompt
+    assert "%LOCALAPPDATA%\\\\Programs\\\\dbeaver" in teacher_plan.chunks[1].agent_prompt
     assert "Do not import `pywin32`, `pywinauto`, `win32gui`, `win32con`, `win32api`, or `pythoncom`." in teacher_plan.chunks[1].agent_prompt
     assert any(check["kind"] == "process_exists" for check in teacher_plan.chunks[2].verification["checks"])
     assert teacher_plan.chunks[1].max_retries == 2
