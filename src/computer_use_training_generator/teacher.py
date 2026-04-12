@@ -65,6 +65,7 @@ Requirements:
 - For general GUI operation tasks, prefer prompts and verifiers that reflect the intended app state, open window/process, created file, or changed project/workspace state.
 - For general GUI operation tasks, prefer Python GUI automation or process/file inspection over instructions written as if a human will take the next action.
 - Do not emit Linux or macOS verification paths unless the task explicitly requires those platforms.
+{execution_style_guidance}
 
 Overall task:
 {task}
@@ -124,6 +125,31 @@ _GENERIC_ACTION_TOKENS = {
     "suitable",
     "edition",
 }
+
+
+def _normalize_execution_style(value: str | None) -> str:
+    normalized = str(value or "python_first").strip().lower().replace("-", "_")
+    if normalized == "gui":
+        normalized = "gui_first"
+    if normalized not in {"python_first", "gui_first"}:
+        normalized = "python_first"
+    return normalized
+
+
+def _execution_style_guidance(execution_style: str) -> str:
+    normalized = _normalize_execution_style(execution_style)
+    if normalized == "gui_first":
+        return (
+            "- Execution style for this planning run: `gui_first`.\n"
+            "- Keep all steps executable in Python, but when the screenshot or current state already shows a browser page, search results, "
+            "download control, installer wizard, or target app window, prefer continuing from that visible UI.\n"
+            "- Do not force direct download or silent install shortcuts when grounded visible UI progression is the safer next step."
+        )
+    return (
+        "- Execution style for this planning run: `python_first`.\n"
+        "- Prefer deterministic Python-first flows such as direct official URL discovery, direct file download, file/process checks, and "
+        "silent or subprocess-based install/launch before browser-click-heavy flows."
+    )
 
 
 def _looks_like_install_task(task: str) -> bool:
@@ -252,10 +278,17 @@ def _normalize_windows_installer_verification(
     return {**verification, "checks": normalized_checks}
 
 
-def _normalize_windows_installer_agent_prompt(*, source_task: str, title: str, agent_prompt: str) -> str:
+def _normalize_windows_installer_agent_prompt(
+    *,
+    source_task: str,
+    title: str,
+    agent_prompt: str,
+    execution_style: str = "python_first",
+) -> str:
     raw = str(agent_prompt or "").strip()
     if not raw:
         return raw
+    normalized_style = _normalize_execution_style(execution_style)
     combined = f"{title}\n{raw}".lower()
     normalized = raw
     common_python_hint = (
@@ -274,6 +307,17 @@ def _normalize_windows_installer_agent_prompt(*, source_task: str, title: str, a
         "silent install은 `/VERYSILENT`, `/SILENT`, `/SP-`, `/NORESTART` 같은 일반적인 Windows installer switch 조합을 우선 시도하세요. "
         "설치 후에는 `%LOCALAPPDATA%`, `%ProgramFiles%`, `%ProgramFiles(x86)%` 아래의 일반적인 설치 경로에서 대상 앱 `.exe`를 찾고, 찾으면 즉시 실행한 뒤 프로세스가 뜰 때까지 확인하세요. "
         "silent install이 분명히 실패하거나 timeout이 나면 같은 silent command를 반복하지 말고 Python GUI 자동화로 현재 설치 창을 진행하세요."
+    )
+    gui_download_hint = (
+        "이 chunk는 실행 가능한 Python 코드만으로 수행하세요. "
+        "현재 스크린샷에 브라우저, 검색 결과, 공식 다운로드 페이지, 다운로드 버튼, 다운로드 진행 UI가 보이면 그 보이는 UI를 Python GUI 자동화로 이어서 사용하세요. "
+        "현재 화면에 근거가 없을 때만 새 페이지를 여세요. 여전히 공식 vendor source를 우선하고 `.zip`이나 archive가 아니라 Windows installer `.exe`를 선택하세요."
+    )
+    gui_install_hint = (
+        "이 install chunk는 실행 가능한 Python 코드만으로 수행하세요. "
+        "현재 스크린샷이나 데스크톱 상태에 installer wizard, UAC prompt, license dialog, destination dialog, completion dialog가 보이면 "
+        "그 visible installer UI를 Python GUI 자동화로 먼저 진행하세요. 현재 화면에 설치 UI가 없을 때만 이미 다운로드된 installer `.exe`를 다시 실행하세요. "
+        "작업 도중 새 다운로드 helper나 URL 탐색 로직을 추가하지 마세요."
     )
     source_hint = _official_source_hint(source_task, title, raw)
     install_action_markers = (
@@ -295,8 +339,9 @@ def _normalize_windows_installer_agent_prompt(*, source_task: str, title: str, a
             "실행할 installer는 현재 작업 대상 앱과 일치하는 `.exe`만 고르세요.\n"
             + _matching_installer_hint(source_task=source_task, title=title, agent_prompt=raw, action="실행")
         )
-        if install_python_hint not in normalized:
-            normalized = f"{install_python_hint}\n\n{normalized}"
+        preferred_install_hint = gui_install_hint if normalized_style == "gui_first" else install_python_hint
+        if preferred_install_hint not in normalized:
+            normalized = f"{preferred_install_hint}\n\n{normalized}"
         if install_hint not in normalized:
             normalized = f"{install_hint}\n\n{normalized}"
         return normalized
@@ -305,8 +350,9 @@ def _normalize_windows_installer_agent_prompt(*, source_task: str, title: str, a
             "이미 Downloads 폴더에 사용할 수 있는 대상 앱의 Windows installer `.exe`가 있으면 새로 받지 말고 그 파일을 그대로 사용해도 됩니다.\n"
             + _matching_installer_hint(source_task=source_task, title=title, agent_prompt=raw, action="사용")
         )
-        if common_python_hint not in normalized:
-            normalized = f"{common_python_hint}\n\n{normalized}"
+        preferred_download_hint = gui_download_hint if normalized_style == "gui_first" else common_python_hint
+        if preferred_download_hint not in normalized:
+            normalized = f"{preferred_download_hint}\n\n{normalized}"
         if source_hint and source_hint not in normalized:
             normalized = f"{normalized}\n\n{source_hint}"
         if reuse_hint not in normalized:
@@ -314,45 +360,74 @@ def _normalize_windows_installer_agent_prompt(*, source_task: str, title: str, a
     return normalized
 
 
-def _normalize_general_gui_agent_prompt(*, title: str, agent_prompt: str) -> str:
+def _normalize_general_gui_agent_prompt(
+    *,
+    title: str,
+    agent_prompt: str,
+    execution_style: str = "python_first",
+) -> str:
     raw = str(agent_prompt or "").strip()
     if not raw:
         return raw
+    normalized_style = _normalize_execution_style(execution_style)
     combined = f"{title}\n{raw}".lower()
     if any(keyword in combined for keyword in ("download", "다운로드", "installer", ".exe", "setup", "설치")):
         return raw
     if not any(keyword in combined for keyword in ("open", "launch", "create", "click", "project", "window", "menu", "dialog", "파일", "열", "실행", "생성", "프로젝트", "창", "메뉴")):
         return raw
-    continue_hint = (
-        "현재 앱이나 창이 이미 열려 있으면 그 상태를 이어서 사용하고, 작업과 무관한 재설치나 재다운로드는 하지 마세요.\n"
-        "사람이 수동으로 조작한다고 가정하지 말고, 캡처 화면을 보고 판단한 뒤 실행 가능한 Python 코드만으로 GUI 상태 확인과 조작을 수행하세요."
-    )
+    if normalized_style == "gui_first":
+        continue_hint = (
+            "현재 앱이나 창이 이미 열려 있으면 그 상태를 이어서 사용하고, 작업과 무관한 재설치나 재다운로드는 하지 마세요.\n"
+            "브라우저, 앱 창, 메뉴, 다이얼로그처럼 현재 캡처에 보이는 UI를 Python GUI 자동화로 이어서 사용하는 쪽을 우선하세요."
+        )
+    else:
+        continue_hint = (
+            "현재 앱이나 창이 이미 열려 있으면 그 상태를 이어서 사용하고, 작업과 무관한 재설치나 재다운로드는 하지 마세요.\n"
+            "사람이 수동으로 조작한다고 가정하지 말고, 캡처 화면을 보고 판단한 뒤 실행 가능한 Python 코드만으로 GUI 상태 확인과 조작을 수행하세요."
+        )
     if continue_hint in raw:
         return raw
     return f"{raw}\n\n{continue_hint}"
 
 
-def _local_install_chunks(task: str) -> list[TeacherTaskChunk]:
+def _local_install_chunks(task: str, *, execution_style: str = "python_first") -> list[TeacherTaskChunk]:
+    normalized_style = _normalize_execution_style(execution_style)
     keyword = (_target_installer_keywords(task, limit=1) or ["targetapp"])[0]
     downloads_subdir = keyword.capitalize()
     installed_exe_glob = f"~/AppData/Local/**/*{keyword}*/{keyword}.exe"
     download_title = f"Download {keyword} installer"
     install_title = f"Install {keyword}"
     launch_title = f"Launch {keyword}"
-    download_prompt = (
-        f"Use executable Python on the Windows machine to download the official Windows installer `.exe` for the target app from this task: {task}. "
-        f"Prefer the official vendor site or official release pages, resolve the current Windows x86_64 setup `.exe` URL in Python, and save it to `%USERPROFILE%\\\\Downloads\\\\{downloads_subdir}\\\\`. "
-        f"If one official page does not expose a raw `.exe` link, inspect another official page or official release page in the same script before failing. Do not use `.zip`, portable, or archive downloads."
-    )
-    install_prompt = (
-        f"{_matching_installer_hint(source_task=task, title=install_title, agent_prompt=task, action='실행')} "
-        f"Use executable Python only. Do not download anything in this chunk. "
-        f"First inspect the current screenshot and desktop state for an installer wizard, UAC prompt, license dialog, destination dialog, or completion dialog, and drive that UI forward if it is visible. "
-        f"Launching only the final app executable is not enough for this chunk. If the app is not already installed, the script must either launch the installer `.exe` itself or operate a visible installer window with Python GUI automation. "
-        f"If no installer UI is visible, find the existing installer `.exe` in `%USERPROFILE%\\\\Downloads\\\\{downloads_subdir}\\\\`, launch it once, wait long enough for setup to appear or continue, and then check only likely install directories such as `%LOCALAPPDATA%\\\\DBeaver`, `%LOCALAPPDATA%\\\\Programs\\\\DBeaver`, `%ProgramFiles%\\\\DBeaver`, and `%ProgramFiles(x86)%\\\\DBeaver` for `{keyword}.exe`. Avoid recursively scanning the whole of `%LOCALAPPDATA%` or `%ProgramFiles%`. "
-        f"Do not import `pywin32`, `pywinauto`, `win32gui`, `win32con`, `win32api`, or `pythoncom`. Prefer the standard library, `psutil`, `pyautogui`, and `pygetwindow` only if clearly needed. "
-        f"Fail explicitly if no valid installer is found or if the install still has not produced the app executable. End only when the installed app `.exe` exists on disk."
-    )
+    if normalized_style == "gui_first":
+        download_prompt = (
+            f"Use executable Python on the Windows machine to obtain the official Windows installer `.exe` for the target app from this task: {task}. "
+            f"First inspect the current screenshot and desktop state. If a browser, search results page, official vendor page, or download control is already visible, continue from that visible UI with Python automation and download the installer into `%USERPROFILE%\\\\Downloads\\\\{downloads_subdir}\\\\`. "
+            f"If no grounded visible UI exists yet, open the official vendor site or official release page in Python and continue there. Do not use `.zip`, portable, or archive downloads."
+        )
+        install_prompt = (
+            f"{_matching_installer_hint(source_task=task, title=install_title, agent_prompt=task, action='실행')} "
+            f"Use executable Python only. Do not download anything in this chunk. "
+            f"First inspect the current screenshot and desktop state for an installer wizard, UAC prompt, license dialog, destination dialog, or completion dialog, and drive that visible UI forward if present. "
+            f"Launching only the final app executable is not enough for this chunk. If no installer UI is visible yet, find the existing installer `.exe` in `%USERPROFILE%\\\\Downloads\\\\{downloads_subdir}\\\\`, launch it once, and then continue from the resulting installer UI. "
+            f"Only after installer progression should you check likely install directories such as `%LOCALAPPDATA%\\\\DBeaver`, `%LOCALAPPDATA%\\\\Programs\\\\DBeaver`, `%ProgramFiles%\\\\DBeaver`, and `%ProgramFiles(x86)%\\\\DBeaver` for `{keyword}.exe`. Avoid recursively scanning the whole of `%LOCALAPPDATA%` or `%ProgramFiles%`. "
+            f"Do not import `pywin32`, `pywinauto`, `win32gui`, `win32con`, `win32api`, or `pythoncom`. Prefer the standard library, `psutil`, `pyautogui`, and `pygetwindow` only if clearly needed. "
+            f"Fail explicitly if no valid installer is found or if the install still has not produced the app executable. End only when the installed app `.exe` exists on disk."
+        )
+    else:
+        download_prompt = (
+            f"Use executable Python on the Windows machine to download the official Windows installer `.exe` for the target app from this task: {task}. "
+            f"Prefer the official vendor site or official release pages, resolve the current Windows x86_64 setup `.exe` URL in Python, and save it to `%USERPROFILE%\\\\Downloads\\\\{downloads_subdir}\\\\`. "
+            f"If one official page does not expose a raw `.exe` link, inspect another official page or official release page in the same script before failing. Do not use `.zip`, portable, or archive downloads."
+        )
+        install_prompt = (
+            f"{_matching_installer_hint(source_task=task, title=install_title, agent_prompt=task, action='실행')} "
+            f"Use executable Python only. Do not download anything in this chunk. "
+            f"First inspect the current screenshot and desktop state for an installer wizard, UAC prompt, license dialog, destination dialog, or completion dialog, and drive that UI forward if it is visible. "
+            f"Launching only the final app executable is not enough for this chunk. If the app is not already installed, the script must either launch the installer `.exe` itself or operate a visible installer window with Python GUI automation. "
+            f"If no installer UI is visible, find the existing installer `.exe` in `%USERPROFILE%\\\\Downloads\\\\{downloads_subdir}\\\\`, launch it once, wait long enough for setup to appear or continue, and then check only likely install directories such as `%LOCALAPPDATA%\\\\DBeaver`, `%LOCALAPPDATA%\\\\Programs\\\\DBeaver`, `%ProgramFiles%\\\\DBeaver`, and `%ProgramFiles(x86)%\\\\DBeaver` for `{keyword}.exe`. Avoid recursively scanning the whole of `%LOCALAPPDATA%` or `%ProgramFiles%`. "
+            f"Do not import `pywin32`, `pywinauto`, `win32gui`, `win32con`, `win32api`, or `pythoncom`. Prefer the standard library, `psutil`, `pyautogui`, and `pygetwindow` only if clearly needed. "
+            f"Fail explicitly if no valid installer is found or if the install still has not produced the app executable. End only when the installed app `.exe` exists on disk."
+        )
     launch_prompt = (
         f"Use executable Python on the Windows machine to locate the already-installed app executable for the target app from this task: {task}, "
         f"launch it once, bring the app window to the foreground if needed, and end only after the app process is running. "
@@ -366,6 +441,7 @@ def _local_install_chunks(task: str) -> list[TeacherTaskChunk]:
                 source_task=task,
                 title=download_title,
                 agent_prompt=download_prompt,
+                execution_style=normalized_style,
             ),
             success_hint=f"A target-app installer `.exe` exists in Downloads\\{downloads_subdir} and is non-empty.",
             preconditions=[
@@ -380,12 +456,17 @@ def _local_install_chunks(task: str) -> list[TeacherTaskChunk]:
             },
             max_retries=1,
             on_fail="retry_current_chunk",
-            notes=["local_teacher_fallback", "python_first_download_chunk"],
+            notes=["local_teacher_fallback", f"{normalized_style}_download_chunk"],
         ),
         TeacherTaskChunk(
             chunk_id="chunk-002",
             title=install_title,
-            agent_prompt=install_prompt,
+            agent_prompt=_normalize_windows_installer_agent_prompt(
+                source_task=task,
+                title=install_title,
+                agent_prompt=install_prompt,
+                execution_style=normalized_style,
+            ),
             success_hint=f"The installed app executable for `{keyword}` exists under AppData Local or another common install path.",
             preconditions=[
                 f"A non-empty target-app installer `.exe` already exists in Downloads\\{downloads_subdir}.",
@@ -397,7 +478,7 @@ def _local_install_chunks(task: str) -> list[TeacherTaskChunk]:
             },
             max_retries=2,
             on_fail="retry_current_chunk",
-            notes=["local_teacher_fallback", "python_first_install_chunk"],
+            notes=["local_teacher_fallback", f"{normalized_style}_install_chunk"],
         ),
         TeacherTaskChunk(
             chunk_id="chunk-003",
@@ -405,6 +486,7 @@ def _local_install_chunks(task: str) -> list[TeacherTaskChunk]:
             agent_prompt=_normalize_general_gui_agent_prompt(
                 title=launch_title,
                 agent_prompt=launch_prompt,
+                execution_style=normalized_style,
             ),
             success_hint=f"The installed app process for `{keyword}` is running.",
             preconditions=[
@@ -417,7 +499,7 @@ def _local_install_chunks(task: str) -> list[TeacherTaskChunk]:
             },
             max_retries=2,
             on_fail="retry_current_chunk",
-            notes=["local_teacher_fallback", "python_first_launch_chunk"],
+            notes=["local_teacher_fallback", f"{normalized_style}_launch_chunk"],
         ),
     ]
 
@@ -429,7 +511,9 @@ def build_local_teacher_fallback(
     command_template: str,
     cwd: str | None,
     error: str,
+    execution_style: str = "python_first",
 ) -> tuple[TeacherResult, TeacherChunkPlanResult]:
+    normalized_style = _normalize_execution_style(execution_style)
     command_result = _fallback_command_result(
         prompt=prompt,
         command_template=command_template,
@@ -438,10 +522,14 @@ def build_local_teacher_fallback(
     )
     response_text = (
         "Local fallback planner generated this plan because the external teacher was unavailable. "
-        "Use Python-first Windows automation: discover the official installer, download it to Downloads, then install and launch the app."
+        + (
+            "Use GUI-first Windows automation: continue from visible browser or installer UI when grounded by the screenshot, and keep all steps executable in Python."
+            if normalized_style == "gui_first"
+            else "Use Python-first Windows automation: discover the official installer, download it to Downloads, then install and launch the app."
+        )
     )
     if _looks_like_install_task(task):
-        chunks = _local_install_chunks(task)
+        chunks = _local_install_chunks(task, execution_style=normalized_style)
     else:
         chunks = [
             TeacherTaskChunk(
@@ -453,7 +541,7 @@ def build_local_teacher_fallback(
                 verification=None,
                 max_retries=0,
                 on_fail="fail_session",
-                notes=["local_teacher_fallback_generic"],
+                notes=["local_teacher_fallback_generic", normalized_style],
             )
         ]
     teacher_result = TeacherResult(
@@ -508,7 +596,14 @@ def _extract_json_object(text: str) -> dict:
     return payload
 
 
-def _normalize_chunks(payload: dict, *, source_task: str, source_text: str) -> list[TeacherTaskChunk]:
+def _normalize_chunks(
+    payload: dict,
+    *,
+    source_task: str,
+    source_text: str,
+    execution_style: str = "python_first",
+) -> list[TeacherTaskChunk]:
+    normalized_style = _normalize_execution_style(execution_style)
     raw_chunks = payload.get("chunks")
     if not isinstance(raw_chunks, list):
         raise RuntimeError("teacher split output did not contain a chunks list")
@@ -525,8 +620,13 @@ def _normalize_chunks(payload: dict, *, source_task: str, source_text: str) -> l
             source_task=source_task,
             title=title,
             agent_prompt=agent_prompt,
+            execution_style=normalized_style,
         )
-        agent_prompt = _normalize_general_gui_agent_prompt(title=title, agent_prompt=agent_prompt)
+        agent_prompt = _normalize_general_gui_agent_prompt(
+            title=title,
+            agent_prompt=agent_prompt,
+            execution_style=normalized_style,
+        )
         success_hint = str(item.get("success_hint") or "").strip() or None
         preconditions = [str(value).strip() for value in item.get("preconditions", []) if str(value).strip()] if isinstance(item.get("preconditions"), list) else []
         raw_verification = item.get("verification")
@@ -583,10 +683,13 @@ def split_teacher_response(
     command_template: str,
     cwd: str | None,
     timeout_s: float,
+    execution_style: str = "python_first",
 ) -> TeacherChunkPlanResult:
+    normalized_style = _normalize_execution_style(execution_style)
     split_prompt = _SPLIT_PROMPT_TEMPLATE.format(
         task=task.strip(),
         teacher_text=teacher_text.strip(),
+        execution_style_guidance=_execution_style_guidance(normalized_style),
     )
     result, response_text = _run_teacher_command(
         prompt=split_prompt,
@@ -596,7 +699,12 @@ def split_teacher_response(
     )
     try:
         payload = _extract_json_object(response_text)
-        chunks = _normalize_chunks(payload, source_task=task, source_text=teacher_text)
+        chunks = _normalize_chunks(
+            payload,
+            source_task=task,
+            source_text=teacher_text,
+            execution_style=normalized_style,
+        )
     except Exception:
         chunks = [
             TeacherTaskChunk(

@@ -42,6 +42,7 @@ def _base_agent_command(
     endpoint: str | None,
     config_path: str | None,
     reasoning_enabled: bool,
+    execution_style: str | None = None,
     request_timeout_s: float | None = None,
 ) -> list[str]:
     command = [agent_command]
@@ -51,6 +52,8 @@ def _base_agent_command(
         command.extend(["--endpoint", endpoint])
     if reasoning_enabled:
         command.append("--reasoning-enabled")
+    if execution_style:
+        command.extend(["--execution-style", str(execution_style)])
     if request_timeout_s is not None:
         timeout_value = str(float(request_timeout_s))
         command.extend(["--load-request-timeout-s", timeout_value])
@@ -102,6 +105,7 @@ def bootstrap_agent(
     endpoint: str | None,
     config_path: str | None,
     reasoning_enabled: bool,
+    execution_style: str | None,
     cwd: str | None,
     timeout_s: float,
 ) -> AgentInvocationResult:
@@ -110,6 +114,7 @@ def bootstrap_agent(
         endpoint=endpoint,
         config_path=config_path,
         reasoning_enabled=reasoning_enabled,
+        execution_style=execution_style,
         request_timeout_s=timeout_s,
     )
     command.extend(["--model-id", model_id])
@@ -129,6 +134,7 @@ def run_agent_prompt(
     endpoint: str | None,
     config_path: str | None,
     reasoning_enabled: bool,
+    execution_style: str | None,
     cwd: str | None,
     timeout_s: float,
 ) -> AgentInvocationResult:
@@ -137,6 +143,7 @@ def run_agent_prompt(
         endpoint=endpoint,
         config_path=config_path,
         reasoning_enabled=reasoning_enabled,
+        execution_style=execution_style,
         request_timeout_s=timeout_s,
     )
     command.extend(["--prompt", prompt])
@@ -147,9 +154,11 @@ def run_agent_prompt(
             {
                 "action": "run",
                 "prompt": prompt,
-                # Reuse the already-loaded daemon defaults. The user is expected
-                # to start the daemon separately for external-cli workflows.
-                "overrides": {},
+                "overrides": (
+                    {"execution_style": str(execution_style)}
+                    if execution_style
+                    else {}
+                ),
             },
             timeout_s=timeout_s,
         )

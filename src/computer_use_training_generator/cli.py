@@ -65,6 +65,15 @@ def _override(config: dict, key: str, value):
     config[key] = value
 
 
+def _normalize_execution_style(value: str | None) -> str:
+    normalized = str(value or "python_first").strip().lower().replace("-", "_")
+    if normalized == "gui":
+        normalized = "gui_first"
+    if normalized not in {"python_first", "gui_first"}:
+        normalized = "python_first"
+    return normalized
+
+
 def _session_outcome_arg(value: str) -> str:
     normalized = value.lower()
     if normalized not in {"success", "fail", "unknown"}:
@@ -86,6 +95,7 @@ def _build_effective_config(args: argparse.Namespace) -> tuple[dict, Path | None
     _override(config, "agent_bootstrap_timeout_s", getattr(args, "agent_bootstrap_timeout_s", None))
     _override(config, "agent_prompt_timeout_s", getattr(args, "agent_prompt_timeout_s", None))
     _override(config, "chunk_verification_timeout_s", getattr(args, "chunk_verification_timeout_s", None))
+    _override(config, "execution_style", getattr(args, "execution_style", None))
     if getattr(args, "teacher_split_enabled", False):
         config["teacher_split_enabled"] = True
     if getattr(args, "agent_reasoning_enabled", False):
@@ -94,6 +104,7 @@ def _build_effective_config(args: argparse.Namespace) -> tuple[dict, Path | None
         config["chunk_verification_enabled"] = True
     if getattr(args, "output_dir", None) is not None:
         config["output_dir"] = str(Path(args.output_dir).resolve())
+    config["execution_style"] = _normalize_execution_style(config.get("execution_style"))
     return config, config_path
 
 
@@ -111,11 +122,20 @@ def _serialize_chunk(chunk: TeacherTaskChunk) -> dict:
     }
 
 
-def _compose_chunk_prompt(chunk: TeacherTaskChunk) -> str:
-    parts = [
-        "Return executable Python only for this chunk. Do not ask a human to perform manual GUI actions outside the generated Python.",
-        chunk.agent_prompt.strip(),
-    ]
+def _compose_chunk_prompt(chunk: TeacherTaskChunk, *, execution_style: str = "python_first") -> str:
+    normalized_style = _normalize_execution_style(execution_style)
+    if normalized_style == "gui_first":
+        prefix = (
+            "Return executable Python only for this chunk. Prefer continuing from the currently visible browser, "
+            "search results, download UI, app window, or installer dialog when that UI is already on screen. "
+            "Do not ask a human to perform manual GUI actions outside the generated Python."
+        )
+    else:
+        prefix = (
+            "Return executable Python only for this chunk. Do not ask a human to perform manual GUI actions "
+            "outside the generated Python."
+        )
+    parts = [prefix, chunk.agent_prompt.strip()]
     if chunk.success_hint:
         parts.append(f"Current chunk success target: {chunk.success_hint}")
     if chunk.preconditions:
@@ -124,7 +144,13 @@ def _compose_chunk_prompt(chunk: TeacherTaskChunk) -> str:
     return "\n\n".join(part for part in parts if part)
 
 
-def _compose_retry_prompt(*, chunk: TeacherTaskChunk, verification_result: dict, attempt_index: int) -> str:
+def _compose_retry_prompt(
+    *,
+    chunk: TeacherTaskChunk,
+    verification_result: dict,
+    attempt_index: int,
+    execution_style: str = "python_first",
+) -> str:
     evidence = verification_result.get("evidence")
     error = verification_result.get("error")
     evidence_text = json.dumps(evidence, ensure_ascii=False, indent=2) if evidence else "[]"
@@ -133,7 +159,23 @@ def _compose_retry_prompt(*, chunk: TeacherTaskChunk, verification_result: dict,
     if error:
         details.append(f"Verifier error: {error}")
     details.append(f"Verifier evidence:\n{evidence_text}")
-    return _compose_chunk_prompt(chunk) + "\n\n" + "\n\n".join(details)
+    return _compose_chunk_prompt(chunk, execution_style=execution_style) + "\n\n" + "\n\n".join(details)
+
+
+def _teacher_execution_style_context(execution_style: str) -> str:
+    normalized_style = _normalize_execution_style(execution_style)
+    if normalized_style == "gui_first":
+        return (
+            "Plan for GUI-first automation. The agent still returns executable Python only, but when the current "
+            "screenshot already shows a browser page, search results, a download control, an installer wizard, a UAC "
+            "prompt, or an app window, prefer advancing that visible UI state before replacing it with a fresh direct "
+            "download or silent-install shortcut."
+        )
+    return (
+        "Plan for Python-first automation. Prefer deterministic Python flows such as direct official URL download, "
+        "file verification in Downloads, subprocess-based installer launch, and Python GUI automation only for the "
+        "remaining dialogs."
+    )
 
 
 def _chunk_completed_from_agent_payload(payload: dict) -> bool:
@@ -144,9 +186,10 @@ def _chunk_completed_from_agent_payload(payload: dict) -> bool:
 
 def _compose_teacher_prompt(*, task: str, config: dict) -> str:
     context = str(config.get("teacher_task_context") or "").strip()
+    style_context = _teacher_execution_style_context(str(config.get("execution_style") or "python_first"))
     if not context:
-        return task
-    return f"{context}\n\nActual task for the target machine:\n{task.strip()}"
+        return f"{style_context}\n\nActual task for the target machine:\n{task.strip()}"
+    return f"{context}\n\n{style_context}\n\nActual task for the target machine:\n{task.strip()}"
 
 
 def _request_terminal_attention(message: str) -> None:
@@ -274,6 +317,7 @@ def cmd_run_session(args: argparse.Namespace) -> int:
     teacher_workdir = config.get("teacher_workdir")
     teacher_timeout_s = float(config.get("teacher_timeout_s", 300))
     teacher_split_enabled = bool(config.get("teacher_split_enabled", True))
+    execution_style = _normalize_execution_style(str(config.get("execution_style") or "python_first"))
     try:
         teacher_result = run_teacher(
             prompt=teacher_prompt,
@@ -288,6 +332,7 @@ def cmd_run_session(args: argparse.Namespace) -> int:
                 command_template=teacher_command_template,
                 cwd=teacher_workdir,
                 timeout_s=float(config.get("teacher_split_timeout_s", teacher_timeout_s)),
+                execution_style=execution_style,
             )
         else:
             teacher_plan = TeacherChunkPlanResult(
@@ -315,6 +360,7 @@ def cmd_run_session(args: argparse.Namespace) -> int:
             command_template=teacher_command_template,
             cwd=teacher_workdir,
             error=str(exc),
+            execution_style=execution_style,
         )
 
     session_id, session_root = prepare_session_root(output_dir=str(config["output_dir"]), task=args.task)
@@ -352,6 +398,7 @@ def cmd_run_session(args: argparse.Namespace) -> int:
             endpoint=config.get("agent_endpoint"),
             config_path=config.get("agent_config_path"),
             reasoning_enabled=bool(config.get("agent_reasoning_enabled", False)),
+            execution_style=execution_style,
             cwd=config.get("agent_workdir"),
             timeout_s=float(config.get("agent_bootstrap_timeout_s", 600)),
         )
@@ -397,12 +444,13 @@ def cmd_run_session(args: argparse.Namespace) -> int:
             if chunk_completed:
                 break
             attempts_used += 1
-            prompt_text = _compose_chunk_prompt(chunk)
+            prompt_text = _compose_chunk_prompt(chunk, execution_style=execution_style)
             if attempt_index > 0 and final_verification_result is not None:
                 prompt_text = _compose_retry_prompt(
                     chunk=chunk,
                     verification_result=final_verification_result,
                     attempt_index=attempt_index,
+                    execution_style=execution_style,
                 )
             prompt_result = run_agent_prompt(
                 agent_command=str(config["agent_command"]),
@@ -410,6 +458,7 @@ def cmd_run_session(args: argparse.Namespace) -> int:
                 endpoint=config.get("agent_endpoint"),
                 config_path=config.get("agent_config_path"),
                 reasoning_enabled=bool(config.get("agent_reasoning_enabled", False)),
+                execution_style=execution_style,
                 cwd=config.get("agent_workdir"),
                 timeout_s=float(config.get("agent_prompt_timeout_s", 1800)),
             )
@@ -582,6 +631,7 @@ def build_parser() -> argparse.ArgumentParser:
     run_parser.add_argument("--teacher-workdir", default=None, help="Teacher command working directory.")
     run_parser.add_argument("--teacher-split-enabled", action="store_true", help="Ask the teacher to split its own response into sequential agent chunks.")
     run_parser.add_argument("--teacher-split-timeout-s", type=float, default=None, help="Teacher split command timeout.")
+    run_parser.add_argument("--execution-style", choices=("python_first", "gui_first"), default=None, help="How teacher/chunk prompts should bias agent behavior.")
     run_parser.add_argument("--agent-command", default=None, help="Path or name of qwen-computer-use-agent.")
     run_parser.add_argument("--agent-model-id", default=None, help="Model path passed to qwen-computer-use-agent --model-id.")
     run_parser.add_argument("--agent-config-path", default=None, help="Config path passed to qwen-computer-use-agent --config.")

@@ -150,6 +150,24 @@ def test_compose_chunk_prompt_requires_python_only() -> None:
     assert prompt.startswith("Return executable Python only for this chunk.")
 
 
+def test_compose_chunk_prompt_gui_first_mentions_visible_ui() -> None:
+    prompt = _compose_chunk_prompt(
+        TeacherTaskChunk(
+            chunk_id="chunk-001",
+            title="Download DBeaver",
+            agent_prompt="DBeaver installer `.exe`를 다운로드하세요.",
+            success_hint=None,
+            preconditions=[],
+            verification=None,
+            max_retries=0,
+            on_fail="fail_session",
+            notes=[],
+        ),
+        execution_style="gui_first",
+    )
+    assert "currently visible browser" in prompt
+
+
 def test_build_local_teacher_fallback_for_install_task_produces_python_first_chunks() -> None:
     teacher_result, teacher_plan = build_local_teacher_fallback(
         task="dbeaver를 설치해줘",
@@ -157,6 +175,7 @@ def test_build_local_teacher_fallback_for_install_task_produces_python_first_chu
         command_template="codex exec '{prompt}'",
         cwd="..",
         error="teacher quota exhausted",
+        execution_style="python_first",
     )
     assert "external teacher was unavailable" in teacher_result.response_text
     assert len(teacher_plan.chunks) == 3
@@ -173,3 +192,18 @@ def test_build_local_teacher_fallback_for_install_task_produces_python_first_chu
     assert any(check["kind"] == "process_exists" for check in teacher_plan.chunks[2].verification["checks"])
     assert teacher_plan.chunks[1].max_retries == 2
     assert teacher_plan.chunks[2].max_retries == 2
+
+
+def test_build_local_teacher_fallback_for_install_task_can_produce_gui_first_chunks() -> None:
+    teacher_result, teacher_plan = build_local_teacher_fallback(
+        task="dbeaver를 설치해줘",
+        prompt="dummy prompt",
+        command_template="codex exec '{prompt}'",
+        cwd="..",
+        error="teacher quota exhausted",
+        execution_style="gui_first",
+    )
+    assert "GUI-first Windows automation" in teacher_result.response_text
+    assert "현재 스크린샷에 브라우저" in teacher_plan.chunks[0].agent_prompt
+    assert "drive that visible UI forward if present" in teacher_plan.chunks[1].agent_prompt
+    assert "gui_first_download_chunk" in teacher_plan.chunks[0].notes
