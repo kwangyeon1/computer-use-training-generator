@@ -4,10 +4,13 @@ from computer_use_training_generator.verification import (
     build_verification_code,
 )
 from computer_use_training_generator.teacher import (
+    _merge_gui_first_navigation_chunks,
+    _normalize_chunks,
     build_local_teacher_fallback,
     _normalize_general_gui_agent_prompt,
     _normalize_windows_installer_agent_prompt,
     _simplify_windows_installer_glob,
+    _target_installer_keywords,
 )
 from computer_use_training_generator.cli import _compose_chunk_prompt
 from computer_use_training_generator.models import TeacherTaskChunk
@@ -98,6 +101,16 @@ def test_normalize_windows_installer_agent_prompt_uses_target_app_keyword() -> N
     assert "`locate`" not in prompt
 
 
+def test_target_installer_keywords_filters_generic_english_words() -> None:
+    keywords = _target_installer_keywords(
+        "Using Python, download the official KakaoTalk Windows installer .exe from the official page.",
+        limit=3,
+    )
+    assert "kakaotalk" in keywords
+    assert "python" not in keywords
+    assert "the" not in keywords
+
+
 def test_normalize_windows_installer_agent_prompt_adds_install_chunk_guidance() -> None:
     prompt = _normalize_windows_installer_agent_prompt(
         source_task="dbeaver를 설치해줘",
@@ -166,6 +179,67 @@ def test_compose_chunk_prompt_gui_first_mentions_visible_ui() -> None:
         execution_style="gui_first",
     )
     assert "currently visible browser" in prompt
+    assert "do not switch to fresh direct HTTP fetching" in prompt
+
+
+def test_normalize_chunks_adds_file_size_check_for_windows_download_chunk() -> None:
+    chunks = _normalize_chunks(
+        {
+            "chunks": [
+                {
+                    "chunk_id": "chunk-001",
+                    "title": "Download installer exe",
+                    "agent_prompt": "Open the official page and download the Windows installer `.exe` into Downloads.",
+                    "verification": {
+                        "checks": [
+                            {"kind": "file_exists_glob", "pattern": "~/Downloads/*kakaotalk*.exe"},
+                        ]
+                    },
+                }
+            ]
+        },
+        source_task="카카오톡 pc버전 프로그램을 설치해줘",
+        source_text="dummy",
+        execution_style="gui_first",
+    )
+    checks = chunks[0].verification["checks"]
+    assert any(check["kind"] == "file_size_gt" for check in checks)
+
+
+def test_merge_gui_first_navigation_chunks_folds_page_open_into_download() -> None:
+    chunks = _merge_gui_first_navigation_chunks(
+        [
+            TeacherTaskChunk(
+                chunk_id="chunk-001",
+                title="Open official page",
+                agent_prompt="Use Python to open a browser and navigate to the official download page, then identify the installer link.",
+                preconditions=["Browser is available."],
+                verification={"checks": [{"kind": "path_exists", "path": "~/Downloads"}]},
+                max_retries=1,
+                on_fail="retry_current_chunk",
+                notes=[],
+            ),
+            TeacherTaskChunk(
+                chunk_id="chunk-002",
+                title="Download installer exe",
+                agent_prompt="Download the official Windows installer `.exe` into Downloads.",
+                preconditions=["Official page is reachable."],
+                verification={
+                    "checks": [
+                        {"kind": "file_exists_glob", "pattern": "~/Downloads/*targetapp*.exe"},
+                        {"kind": "file_size_gt", "pattern": "~/Downloads/*targetapp*.exe", "bytes": 1000000},
+                    ]
+                },
+                max_retries=1,
+                on_fail="retry_current_chunk",
+                notes=[],
+            ),
+        ]
+    )
+    assert len(chunks) == 1
+    assert "Navigation stage to preserve" in chunks[0].agent_prompt
+    assert "Download stage" in chunks[0].agent_prompt
+    assert "merged_prior_navigation_chunk" in chunks[0].notes
 
 
 def test_build_local_teacher_fallback_for_install_task_produces_python_first_chunks() -> None:

@@ -62,6 +62,7 @@ Requirements:
 - For Windows installer download chunks, state explicitly in `agent_prompt` that the agent must download the installer `.exe` and must avoid `.zip` or archive builds.
 - For Windows installer download chunks, prefer deterministic Python-first flows: direct official URL discovery, Python download to `Downloads`, file-size/path verification, and Python-launched installer execution before browser-click-heavy flows.
 - For Windows installer download chunks, prefer prompts that name the exact official landing page or release page URL to fetch first, then instruct the agent to resolve relative or absolute `.exe` links from that page.
+- For GUI-first install/download tasks, do not emit a standalone browser-navigation chunk whose verifier only checks a generic state such as `~/Downloads` existing. If opening an official page is only preparation for a download, fold that navigation into the download chunk and verify the actual downloaded installer artifact instead.
 - Only fall back to browser GUI navigation when a direct official installer URL cannot be determined from the teacher answer or current task context.
 - For general GUI operation tasks after installation, continue from the current desktop/app state instead of restarting setup or redownloading software unless the task explicitly asks for it.
 - For general GUI operation tasks, prefer prompts and verifiers that reflect the intended app state, open window/process, created file, or changed project/workspace state.
@@ -128,6 +129,76 @@ _GENERIC_ACTION_TOKENS = {
     "edition",
 }
 
+_GENERIC_STOP_TOKENS = {
+    "a",
+    "an",
+    "and",
+    "any",
+    "app",
+    "archive",
+    "artifact",
+    "browser",
+    "build",
+    "button",
+    "client",
+    "code",
+    "confirm",
+    "continue",
+    "current",
+    "desktop",
+    "dialog",
+    "download",
+    "downloads",
+    "entry",
+    "exe",
+    "file",
+    "first",
+    "follow",
+    "from",
+    "generated",
+    "gui",
+    "have",
+    "html",
+    "https",
+    "identify",
+    "installer",
+    "just",
+    "latest",
+    "link",
+    "machine",
+    "not",
+    "official",
+    "only",
+    "open",
+    "page",
+    "perform",
+    "portable",
+    "program",
+    "prompt",
+    "python",
+    "release",
+    "return",
+    "same",
+    "save",
+    "screen",
+    "setup",
+    "step",
+    "target",
+    "task",
+    "that",
+    "the",
+    "their",
+    "then",
+    "this",
+    "use",
+    "using",
+    "vendor",
+    "visible",
+    "when",
+    "windows",
+    "with",
+}
+
 
 def _normalize_execution_style(value: str | None) -> str:
     normalized = str(value or "python_first").strip().lower().replace("-", "_")
@@ -182,6 +253,7 @@ def _target_installer_keywords(*parts: str, limit: int = 2) -> list[str]:
                 not token
                 or token in _GENERIC_INSTALLER_TOKENS
                 or token in _GENERIC_ACTION_TOKENS
+                or token in _GENERIC_STOP_TOKENS
                 or token.isdigit()
                 or len(token) <= 2
             ):
@@ -265,21 +337,122 @@ def _normalize_windows_installer_verification(
         return verification
     normalized_checks: list[dict] = []
     changed = False
+    has_file_exists_glob = False
+    has_file_size_gt = False
+    candidate_pattern = ""
     for item in checks:
         if not isinstance(item, dict):
             normalized_checks.append(item)
             continue
         updated = dict(item)
-        if str(updated.get("kind") or "").strip() == "file_exists_glob":
+        kind = str(updated.get("kind") or "").strip()
+        if kind == "file_exists_glob":
             pattern = str(updated.get("pattern") or "").strip()
             simplified = _simplify_windows_installer_glob(pattern)
             if simplified and simplified != pattern:
                 updated["pattern"] = simplified
                 changed = True
+            has_file_exists_glob = True
+            candidate_pattern = str(updated.get("pattern") or "").strip() or candidate_pattern
+        elif kind == "file_size_gt":
+            has_file_size_gt = True
         normalized_checks.append(updated)
+    if has_file_exists_glob and not has_file_size_gt and candidate_pattern:
+        normalized_checks.append(
+            {
+                "kind": "file_size_gt",
+                "pattern": candidate_pattern,
+                "bytes": 1_000_000,
+            }
+        )
+        changed = True
     if not changed:
         return verification
     return {**verification, "checks": normalized_checks}
+
+
+def _chunk_has_verification_kind(chunk: TeacherTaskChunk, *kinds: str) -> bool:
+    checks = (chunk.verification or {}).get("checks")
+    if not isinstance(checks, list):
+        return False
+    expected = {str(kind).strip() for kind in kinds if str(kind).strip()}
+    for item in checks:
+        if not isinstance(item, dict):
+            continue
+        if str(item.get("kind") or "").strip() in expected:
+            return True
+    return False
+
+
+def _looks_like_download_chunk(title: str, agent_prompt: str) -> bool:
+    combined = f"{title}\n{agent_prompt}".lower()
+    return ".exe" in combined and any(
+        token in combined for token in ("download", "다운로드", "installer", "setup", "downloads folder")
+    )
+
+
+def _looks_like_navigation_only_chunk(chunk: TeacherTaskChunk) -> bool:
+    combined = f"{chunk.title}\n{chunk.agent_prompt}".lower()
+    if _chunk_has_verification_kind(chunk, "file_exists_glob", "file_size_gt", "process_exists"):
+        return False
+    if ".exe" in combined and any(token in combined for token in ("download", "다운로드", "downloads folder")):
+        return False
+    navigation_markers = (
+        "open a browser",
+        "navigate to",
+        "official page",
+        "landing page",
+        "download page",
+        "official site",
+        "locate the download",
+        "locate the installer",
+        "identify the installer",
+        "브라우저",
+        "페이지",
+        "공식 페이지",
+    )
+    return any(marker in combined for marker in navigation_markers)
+
+
+def _merge_gui_first_navigation_chunks(chunks: list[TeacherTaskChunk]) -> list[TeacherTaskChunk]:
+    if len(chunks) < 2:
+        return chunks
+    merged: list[TeacherTaskChunk] = []
+    index = 0
+    while index < len(chunks):
+        current = chunks[index]
+        next_chunk = chunks[index + 1] if index + 1 < len(chunks) else None
+        if (
+            next_chunk is not None
+            and _looks_like_navigation_only_chunk(current)
+            and _looks_like_download_chunk(next_chunk.title, next_chunk.agent_prompt)
+        ):
+            merged_prompt = (
+                "If the current browser or desktop state has not yet reached the official download UI, "
+                "complete that navigation first and then continue directly into the download in the same chunk.\n\n"
+                f"Navigation stage to preserve:\n{current.agent_prompt.strip()}\n\n"
+                f"Download stage:\n{next_chunk.agent_prompt.strip()}"
+            )
+            merged_preconditions = list(dict.fromkeys([*current.preconditions, *next_chunk.preconditions]))
+            merged_notes = list(dict.fromkeys([*next_chunk.notes, "merged_prior_navigation_chunk"]))
+            merged.append(
+                TeacherTaskChunk(
+                    chunk_id=next_chunk.chunk_id,
+                    title=next_chunk.title,
+                    agent_prompt=merged_prompt,
+                    success_hint=next_chunk.success_hint,
+                    preconditions=merged_preconditions,
+                    verification=next_chunk.verification,
+                    max_retries=next_chunk.max_retries,
+                    on_fail=next_chunk.on_fail,
+                    notes=merged_notes,
+                )
+            )
+            index += 2
+            continue
+        merged.append(current)
+        index += 1
+    return merged
 
 
 def _normalize_windows_installer_agent_prompt(
@@ -319,7 +492,9 @@ def _normalize_windows_installer_agent_prompt(
     gui_download_hint = (
         "이 chunk는 실행 가능한 Python 코드만으로 수행하세요. "
         "현재 스크린샷에 브라우저, 검색 결과, 공식 다운로드 페이지, 다운로드 버튼, 다운로드 진행 UI가 보이면 그 보이는 UI를 Python GUI 자동화로 이어서 사용하세요. "
-        "현재 화면에 근거가 없을 때만 새 페이지를 여세요. 여전히 공식 vendor source를 우선하고 `.zip`이나 archive가 아니라 Windows installer `.exe`를 선택하세요."
+        "현재 화면에 근거가 없을 때만 새 페이지를 여세요. "
+        "근거 있는 visible browser/download UI가 이미 있으면 그 chunk 안에서 새 urllib/requests HTML scraping이나 fresh direct fetch로 갈아타지 말고, 먼저 그 UI를 끝까지 진행하세요. "
+        "여전히 공식 vendor source를 우선하고 `.zip`이나 archive가 아니라 Windows installer `.exe`를 선택하세요."
     )
     gui_install_hint = (
         "이 install chunk는 실행 가능한 Python 코드만으로 수행하세요. "
@@ -669,6 +844,8 @@ def _normalize_chunks(
             )
         )
     if normalized:
+        if normalized_style == "gui_first":
+            normalized = _merge_gui_first_navigation_chunks(normalized)
         return normalized
     return [
         TeacherTaskChunk(

@@ -128,7 +128,9 @@ def _compose_chunk_prompt(chunk: TeacherTaskChunk, *, execution_style: str = "py
         prefix = (
             "Return executable Python only for this chunk. Prefer continuing from the currently visible browser, "
             "search results, download UI, app window, or installer dialog when that UI is already on screen. "
-            "Do not ask a human to perform manual GUI actions outside the generated Python."
+            "Do not ask a human to perform manual GUI actions outside the generated Python. "
+            "If grounded visible browser/download/installer UI is already available, do not switch to fresh direct HTTP fetching, "
+            "HTML scraping, or silent-install shortcuts in the same step unless the latest execution proves that UI path stalled."
         )
     else:
         prefix = (
