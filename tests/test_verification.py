@@ -111,6 +111,21 @@ def test_target_installer_keywords_filters_generic_english_words() -> None:
     assert "the" not in keywords
 
 
+def test_target_installer_keywords_filter_template_words_from_gui_first_prompt() -> None:
+    keywords = _target_installer_keywords(
+        "카카오톡 pc버전 프로그램을 설치해줘",
+        "Open official download page",
+        "Use Python-driven browser automation on the Windows desktop to open the official KakaoTalk service page and verify the downloaded installer.",
+        limit=4,
+    )
+    assert "kakaotalk" in keywords
+    assert "driven" not in keywords
+    assert "automation" not in keywords
+    assert "verify" not in keywords
+    assert "downloaded" not in keywords
+    assert "service" not in keywords
+
+
 def test_normalize_windows_installer_agent_prompt_adds_install_chunk_guidance() -> None:
     prompt = _normalize_windows_installer_agent_prompt(
         source_task="dbeaver를 설치해줘",
