@@ -126,6 +126,13 @@ def test_target_installer_keywords_filter_template_words_from_gui_first_prompt()
     assert "service" not in keywords
 
 
+def test_target_installer_keywords_extract_korean_app_name() -> None:
+    keywords = _target_installer_keywords("카카오톡 pc버전 프로그램을 설치해줘", limit=2)
+    assert "카카오톡" in keywords
+    assert "프로그램을" not in keywords
+    assert "설치해줘" not in keywords
+
+
 def test_normalize_windows_installer_agent_prompt_adds_install_chunk_guidance() -> None:
     prompt = _normalize_windows_installer_agent_prompt(
         source_task="dbeaver를 설치해줘",
@@ -150,6 +157,21 @@ def test_normalize_windows_installer_agent_prompt_does_not_add_run_hint_to_downl
     )
     assert "실행할 installer는" not in prompt
     assert "새로 받지 말고" in prompt
+
+
+def test_normalize_windows_installer_agent_prompt_keeps_download_chunk_as_download_when_text_mentions_finishing() -> None:
+    prompt = _normalize_windows_installer_agent_prompt(
+        source_task="카카오톡 pc버전 프로그램을 설치해줘",
+        title="Download installer",
+        agent_prompt=(
+            "Use Python on Windows to open the official vendor page, find the Windows PC installer link, "
+            "download the official `.exe` into Downloads, and confirm the download completed successfully before finishing."
+        ),
+        execution_style="gui_first",
+    )
+    assert "실행할 installer는" not in prompt
+    assert "현재 스크린샷에 브라우저" in prompt
+    assert "새 다운로드 helper나 URL 탐색 로직" not in prompt
 
 
 def test_normalize_general_gui_agent_prompt_adds_continue_hint() -> None:
@@ -296,3 +318,19 @@ def test_build_local_teacher_fallback_for_install_task_can_produce_gui_first_chu
     assert "현재 스크린샷에 브라우저" in teacher_plan.chunks[0].agent_prompt
     assert "drive that visible UI forward if present" in teacher_plan.chunks[1].agent_prompt
     assert "gui_first_download_chunk" in teacher_plan.chunks[0].notes
+
+
+def test_build_local_teacher_fallback_for_korean_task_uses_real_app_token() -> None:
+    _, teacher_plan = build_local_teacher_fallback(
+        task="카카오톡 pc버전 프로그램을 설치해줘",
+        prompt="dummy prompt",
+        command_template="codex exec '{prompt}'",
+        cwd="..",
+        error="teacher quota exhausted",
+        execution_style="gui_first",
+    )
+    download_chunk = teacher_plan.chunks[0]
+    assert "Targetapp" not in download_chunk.agent_prompt
+    assert "카카오톡" in download_chunk.agent_prompt
+    checks = download_chunk.verification["checks"]
+    assert any(check["pattern"] == "~/Downloads/카카오톡/*.exe" for check in checks if check["kind"] == "file_exists_glob")

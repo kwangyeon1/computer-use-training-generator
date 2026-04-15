@@ -75,6 +75,22 @@ def _summarize_failure(executor_payload: dict) -> tuple[str | None, str | None]:
     return None, None
 
 
+def _resolved_target_code(response: dict | None, executor: dict | None) -> str | None:
+    if isinstance(executor, dict):
+        record = executor.get("record")
+        if isinstance(record, dict):
+            payload_metadata = record.get("payload_metadata")
+            if isinstance(payload_metadata, dict):
+                executed_python_code = payload_metadata.get("executed_python_code")
+                if executed_python_code is not None:
+                    return str(executed_python_code)
+    if isinstance(response, dict):
+        python_code = response.get("python_code")
+        if python_code is not None:
+            return str(python_code)
+    return None
+
+
 def _save_image(base64_data: str | None, *, images_dir: Path, filename: str) -> tuple[str | None, str | None]:
     if not base64_data:
         return None, None
@@ -244,7 +260,7 @@ def append_run_artifacts(
                     "stderr_tail": last_execution.get("stderr_tail") if isinstance(last_execution, dict) else None,
                     "error_info": last_execution.get("error_info") if isinstance(last_execution, dict) else None,
                 },
-                "target_code": response.get("python_code") if isinstance(response, dict) else None,
+                "target_code": _resolved_target_code(response, executor),
                 "agent_raw_text": response.get("raw_text") if isinstance(response, dict) else None,
                 "agent_notes": response.get("notes") if isinstance(response, dict) else None,
                 "executor_stdout_tail": executor.get("stdout_tail") if isinstance(executor, dict) else None,

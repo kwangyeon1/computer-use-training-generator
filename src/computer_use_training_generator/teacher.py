@@ -218,6 +218,71 @@ _GENERIC_STOP_TOKENS = {
     "with",
 }
 
+_GENERIC_KOREAN_STOP_TOKENS = {
+    "설치",
+    "설치해줘",
+    "다운로드",
+    "프로그램",
+    "프로그램을",
+    "버전",
+    "pc버전",
+    "윈도우",
+    "공식",
+    "페이지",
+    "실행",
+    "파일",
+    "폴더",
+    "앱",
+    "대상",
+    "최신",
+    "화면",
+    "브라우저",
+    "검색결과",
+    "설치파일",
+}
+
+_KOREAN_PARTICLE_SUFFIXES = (
+    "으로는",
+    "에서는",
+    "에게는",
+    "한테는",
+    "으로",
+    "에서",
+    "에게",
+    "한테",
+    "까지",
+    "부터",
+    "보다",
+    "처럼",
+    "라고",
+    "이라",
+    "라도",
+    "이다",
+    "으로도",
+    "은",
+    "는",
+    "이",
+    "가",
+    "을",
+    "를",
+    "에",
+    "와",
+    "과",
+    "도",
+)
+
+
+def _strip_korean_particle(token: str) -> str:
+    raw = str(token or "").strip().lower()
+    if not raw or re.search(r"[가-힣]", raw) is None:
+        return raw
+    for suffix in _KOREAN_PARTICLE_SUFFIXES:
+        if raw.endswith(suffix) and len(raw) > len(suffix) + 1:
+            candidate = raw[: -len(suffix)]
+            if candidate:
+                return candidate
+    return raw
+
 
 def _normalize_execution_style(value: str | None) -> str:
     normalized = str(value or "python_first").strip().lower().replace("-", "_")
@@ -267,14 +332,17 @@ def _fallback_command_result(*, prompt: str, command_template: str, cwd: str | N
 def _target_installer_keywords(*parts: str, limit: int = 2) -> list[str]:
     tokens: list[str] = []
     for part in parts:
-        for token in re.split(r"[^a-z0-9]+", str(part or "").lower()):
+        for token in re.findall(r"[a-z0-9가-힣]+", str(part or "").lower()):
+            token = _strip_korean_particle(token)
             if (
                 not token
                 or token in _GENERIC_INSTALLER_TOKENS
                 or token in _GENERIC_ACTION_TOKENS
                 or token in _GENERIC_STOP_TOKENS
+                or token in _GENERIC_KOREAN_STOP_TOKENS
                 or token.isdigit()
-                or len(token) <= 2
+                or (re.search(r"[가-힣]", token) is None and len(token) <= 2)
+                or (re.search(r"[가-힣]", token) is not None and len(token) <= 1)
             ):
                 continue
             if token not in tokens:
@@ -522,21 +590,52 @@ def _normalize_windows_installer_agent_prompt(
         "작업 도중 새 다운로드 helper나 URL 탐색 로직을 추가하지 마세요."
     )
     source_hint = _official_source_hint(source_task, title, raw)
+    download_stage_markers = (
+        "download the installer",
+        "download the official",
+        "download the windows",
+        "download the",
+        "save the installer",
+        "save it to",
+        "save it into",
+        "save the downloaded",
+        "find the installer link",
+        "find the windows pc installer link",
+        "find the windows installer link",
+        "official page",
+        "official download page",
+        "official release page",
+        "release page",
+        "landing page",
+        "다운로드",
+        "공식 페이지",
+    )
     install_action_markers = (
+        "run the installer",
+        "launch the installer",
         "run it",
-        "run the",
-        "launch",
-        "execute",
-        "finish",
-        "uac",
-        "wizard",
+        "launch it",
+        "locate the downloaded",
+        "locate the newest",
+        "complete the installation",
+        "finish the installation",
+        "installer wizard",
+        "uac prompt",
+        "license dialog",
+        "destination dialog",
+        "completion dialog",
+        "do not download anything in this chunk",
+        "이미 다운로드된",
+        "설치 마법사",
+        "설치 ui",
         "실행",
         "설치 완료",
         "설치가 완료",
         "마법사",
-        "finish로",
     )
-    if "windows" in combined and ".exe" in combined and any(keyword in combined for keyword in install_action_markers):
+    download_hits = sum(1 for keyword in download_stage_markers if keyword in combined)
+    install_hits = sum(1 for keyword in install_action_markers if keyword in combined)
+    if "windows" in combined and ".exe" in combined and install_hits > download_hits and install_hits > 0:
         install_hint = (
             "실행할 installer는 현재 작업 대상 앱과 일치하는 `.exe`만 고르세요.\n"
             + _matching_installer_hint(source_task=source_task, title=title, agent_prompt=raw, action="실행")
@@ -547,7 +646,7 @@ def _normalize_windows_installer_agent_prompt(
         if install_hint not in normalized:
             normalized = f"{install_hint}\n\n{normalized}"
         return normalized
-    if "windows" in combined and ".exe" in combined and any(keyword in combined for keyword in ("download", "다운로드")):
+    if "windows" in combined and ".exe" in combined and download_hits > 0:
         reuse_hint = (
             "이미 Downloads 폴더에 사용할 수 있는 대상 앱의 Windows installer `.exe`가 있으면 새로 받지 말고 그 파일을 그대로 사용해도 됩니다.\n"
             + _matching_installer_hint(source_task=source_task, title=title, agent_prompt=raw, action="사용")
@@ -653,8 +752,8 @@ def _local_install_chunks(task: str, *, execution_style: str = "python_first") -
             ],
             verification={
                 "checks": [
-                    {"kind": "file_exists_glob", "pattern": f"~/Downloads/{downloads_subdir}/*{keyword}*.exe"},
-                    {"kind": "file_size_gt", "pattern": f"~/Downloads/{downloads_subdir}/*{keyword}*.exe", "bytes": 1000000},
+                    {"kind": "file_exists_glob", "pattern": f"~/Downloads/{downloads_subdir}/*.exe"},
+                    {"kind": "file_size_gt", "pattern": f"~/Downloads/{downloads_subdir}/*.exe", "bytes": 1000000},
                 ]
             },
             max_retries=1,
