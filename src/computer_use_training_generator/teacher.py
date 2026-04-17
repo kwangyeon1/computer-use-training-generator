@@ -1,7 +1,12 @@
 from __future__ import annotations
 
+import base64
+import html
+import hashlib
 import json
 import re
+import urllib.parse
+import urllib.request
 
 from .models import CommandResult, TeacherChunkPlanResult, TeacherResult, TeacherTaskChunk
 from .subprocess_utils import render_command_template, run_command
@@ -241,6 +246,34 @@ _GENERIC_KOREAN_STOP_TOKENS = {
     "설치파일",
 }
 
+_SUSPICIOUS_RESULT_HOST_TOKENS = {
+    "download",
+    "downloads",
+    "setup",
+    "installer",
+    "latest",
+    "free",
+    "get",
+    "safe",
+    "apps-",
+    "app-",
+    "pc-",
+    "win-",
+}
+
+_NON_VENDOR_RESULT_HOST_TOKENS = {
+    "blog",
+    "blogs",
+    "youtube",
+    "youtu",
+    "forum",
+    "community",
+    "reddit",
+    "cafe",
+    "tistory",
+    "medium",
+}
+
 _KOREAN_PARTICLE_SUFFIXES = (
     "으로는",
     "에서는",
@@ -293,6 +326,164 @@ def _normalize_execution_style(value: str | None) -> str:
     return normalized
 
 
+def _decode_bing_result_url(raw_href: str) -> str:
+    href = html.unescape(str(raw_href or "").strip())
+    if not href:
+        return href
+    parsed = urllib.parse.urlparse(href)
+    host = str(parsed.netloc or "").lower()
+    if "bing.com" not in host or not parsed.path.startswith("/ck/"):
+        return href
+    encoded = urllib.parse.parse_qs(parsed.query).get("u", [None])[0]
+    if not encoded:
+        return href
+    payload = str(encoded).strip()
+    if payload.startswith("a1"):
+        payload = payload[2:]
+    try:
+        padding = "=" * (-len(payload) % 4)
+        return base64.urlsafe_b64decode(payload + padding).decode("utf-8", errors="replace")
+    except Exception:
+        return href
+
+
+def _clean_html_text(value: str) -> str:
+    text = html.unescape(str(value or ""))
+    text = re.sub(r"<[^>]+>", " ", text)
+    return " ".join(text.split()).strip()
+
+
+def _extract_bing_result_candidates(html_text: str) -> list[dict[str, str]]:
+    candidates: list[dict[str, str]] = []
+    for block_match in re.finditer(r'<li class="b_algo".*?</li>', str(html_text or ""), flags=re.S):
+        block = block_match.group(0)
+        title_match = re.search(r"<h2[^>]*><a [^>]*href=\"([^\"]+)\"[^>]*>(.*?)</a></h2>", block, flags=re.S)
+        if not title_match:
+            continue
+        raw_href = str(title_match.group(1) or "").strip()
+        raw_title = str(title_match.group(2) or "").strip()
+        snippet_match = re.search(r"<p>(.*?)</p>", block, flags=re.S)
+        raw_snippet = str(snippet_match.group(1) or "").strip() if snippet_match else ""
+        url = _decode_bing_result_url(raw_href)
+        title = _clean_html_text(raw_title)
+        snippet = _clean_html_text(raw_snippet)
+        if not url or not title:
+            continue
+        candidates.append(
+            {
+                "url": url,
+                "title": title,
+                "snippet": snippet,
+            }
+        )
+    return candidates
+
+
+def _registrable_host(host: str) -> str:
+    labels = [label for label in str(host or "").split(".") if label]
+    if len(labels) >= 2:
+        return ".".join(labels[-2:])
+    return str(host or "").lower()
+
+
+def _score_official_page_candidate(task: str, candidate: dict[str, str]) -> int:
+    url = str(candidate.get("url") or "").strip()
+    title = str(candidate.get("title") or "").strip()
+    snippet = str(candidate.get("snippet") or "").strip()
+    if not url or not title:
+        return -10_000
+    parsed = urllib.parse.urlparse(url)
+    host = str(parsed.netloc or "").lower()
+    path = str(parsed.path or "").lower()
+    registrable = _registrable_host(host)
+    labels = [label for label in host.split(".") if label]
+    lead_label = labels[0] if labels else ""
+    combined = "\n".join((title, snippet, url)).lower()
+    keywords = _target_installer_keywords(task, title, snippet, limit=3)
+
+    score = 0
+    if any(token in combined for token in ("official", "공식")):
+        score += 28
+    if any(token in combined for token in ("download", "다운로드", "install", "설치", "windows", "pc")):
+        score += 12
+    if any(token in host for token in _NON_VENDOR_RESULT_HOST_TOKENS):
+        score -= 120
+    if "apps.microsoft.com" in host or "microsoft store" in combined:
+        score -= 18
+    if "notice" in path or "notices" in path:
+        score -= 10
+    if "/download" in path or "/service/" in path or "/release" in path:
+        score += 8
+    if lead_label and any(lead_label.startswith(prefix) for prefix in ("pc-", "win-", "apps-", "app-")):
+        score -= 36
+    for token in _SUSPICIOUS_RESULT_HOST_TOKENS:
+        if token in host:
+            score -= 18
+    score -= host.count("-") * 8
+    if len(labels) <= 3:
+        score += 10
+    if registrable and registrable == host:
+        score += 6
+    if lead_label and len(lead_label) <= 12:
+        score += 6
+    for keyword in keywords:
+        lowered_keyword = keyword.lower()
+        if lowered_keyword in combined:
+            score += 8
+        if lowered_keyword in host:
+            score += 6
+    return score
+
+
+def _select_official_page_urls(task: str, candidates: list[dict[str, str]], *, limit: int = 2) -> list[str]:
+    ranked: list[tuple[int, str]] = []
+    seen: set[str] = set()
+    for candidate in candidates:
+        url = str(candidate.get("url") or "").strip()
+        if not url or url in seen:
+            continue
+        seen.add(url)
+        score = _score_official_page_candidate(task, candidate)
+        ranked.append((score, url))
+    ranked.sort(key=lambda item: item[0], reverse=True)
+    return [url for score, url in ranked[: max(1, int(limit))] if score > -20]
+
+
+def _discover_official_page_urls(task: str, *, limit: int = 2) -> list[str]:
+    keywords = _target_installer_keywords(task, limit=3)
+    if not keywords:
+        return []
+    if any(re.search(r"[가-힣]", keyword) for keyword in keywords):
+        query = " ".join([*keywords, "공식", "다운로드"])
+    else:
+        query = " ".join([*keywords, "official", "windows", "download"])
+    search_url = f"https://www.bing.com/search?q={urllib.parse.quote(query)}"
+    user_agents = (
+        "Mozilla/5.0",
+        (
+            "Mozilla/5.0 (X11; Linux x86_64) AppleWebKit/537.36 "
+            "(KHTML, like Gecko) Chrome/124.0.0.0 Safari/537.36"
+        ),
+    )
+    for user_agent in user_agents:
+        request = urllib.request.Request(
+            search_url,
+            headers={
+                "User-Agent": user_agent,
+                "Accept-Language": "ko-KR,ko;q=0.9,en-US;q=0.8,en;q=0.7",
+            },
+        )
+        try:
+            with urllib.request.urlopen(request, timeout=15) as response:
+                html_text = response.read().decode("utf-8", errors="replace")
+        except Exception:
+            continue
+        selected = _select_official_page_urls(task, _extract_bing_result_candidates(html_text), limit=limit)
+        if selected:
+            return selected
+    return []
+
+
 def _execution_style_guidance(execution_style: str) -> str:
     normalized = _normalize_execution_style(execution_style)
     if normalized == "gui_first":
@@ -300,6 +491,7 @@ def _execution_style_guidance(execution_style: str) -> str:
             "- Execution style for this planning run: `gui_first`.\n"
             "- Keep all steps executable in Python, but when the screenshot or current state already shows a browser page, search results, "
             "download control, installer wizard, or target app window, prefer continuing from that visible UI.\n"
+            "- If a visible download-like or installer-like control is on screen, prefer OCR-grounded click helpers before HTML scraping or fresh HTTP fetching.\n"
             "- Do not force direct download or silent install shortcuts when grounded visible UI progression is the safer next step."
         )
     return (
@@ -312,6 +504,36 @@ def _execution_style_guidance(execution_style: str) -> str:
 def _looks_like_install_task(task: str) -> bool:
     lowered = str(task or "").lower()
     return any(token in lowered for token in ("설치", "install", "installer", "setup"))
+
+
+def _task_explicitly_requests_store(task: str) -> bool:
+    lowered = str(task or "").lower()
+    return any(
+        token in lowered
+        for token in (
+            "microsoft store",
+            "ms store",
+            "windows store",
+            "app store",
+            "스토어",
+            "앱 스토어",
+        )
+    )
+
+
+def _looks_like_store_detour_prompt(agent_prompt: str) -> bool:
+    lowered = str(agent_prompt or "").lower()
+    return any(
+        token in lowered
+        for token in (
+            "ms-windows-store://",
+            "apps.microsoft.com",
+            "microsoft store",
+            "windows store",
+            "app store",
+            "스토어",
+        )
+    )
 
 
 def _fallback_command_result(*, prompt: str, command_template: str, cwd: str | None, error: str) -> CommandResult:
@@ -382,6 +604,15 @@ def _likely_install_path_hint(keyword: str) -> str:
         f"%LOCALAPPDATA%\\\\{target}, %LOCALAPPDATA%\\\\Programs\\\\{target}, "
         f"%ProgramFiles%\\\\{target}, %ProgramFiles(x86)%\\\\{target}"
     )
+
+
+def _task_staging_subdir(task: str) -> str:
+    keywords = _target_installer_keywords(task, limit=2)
+    ascii_parts = [re.sub(r"[^a-z0-9]+", "", keyword.lower()) for keyword in keywords]
+    ascii_parts = [part for part in ascii_parts if part]
+    prefix = "-".join(ascii_parts[:2]) or "targetapp"
+    digest = hashlib.sha1(str(task or "").encode("utf-8")).hexdigest()[:8]
+    return f"{prefix}-{digest}"
 
 
 def _simplify_windows_installer_glob(pattern: str) -> str:
@@ -581,6 +812,7 @@ def _normalize_windows_installer_agent_prompt(
         "현재 스크린샷에 브라우저, 검색 결과, 공식 다운로드 페이지, 다운로드 버튼, 다운로드 진행 UI가 보이면 그 보이는 UI를 Python GUI 자동화로 이어서 사용하세요. "
         "현재 화면에 근거가 없을 때만 새 페이지를 여세요. "
         "근거 있는 visible browser/download UI가 이미 있으면 그 chunk 안에서 새 urllib/requests HTML scraping이나 fresh direct fetch로 갈아타지 말고, 먼저 그 UI를 끝까지 진행하세요. "
+        "보이는 download/install control 이 있으면 OCR-grounded helper 예를 들어 `click_download_like_target()` 또는 `click_text_targets([...])` 같은 helper를 우선 고려하세요. "
         "여전히 공식 vendor source를 우선하고 `.zip`이나 archive가 아니라 Windows installer `.exe`를 선택하세요."
     )
     gui_install_hint = (
@@ -694,8 +926,20 @@ def _normalize_general_gui_agent_prompt(
 def _local_install_chunks(task: str, *, execution_style: str = "python_first") -> list[TeacherTaskChunk]:
     normalized_style = _normalize_execution_style(execution_style)
     keyword = (_target_installer_keywords(task, limit=1) or ["targetapp"])[0]
-    downloads_subdir = keyword.capitalize()
-    installed_exe_glob = f"~/AppData/Local/**/*{keyword}*/{keyword}.exe"
+    discovered_official_urls = _discover_official_page_urls(task, limit=2)
+    discovered_source_hint = ""
+    if discovered_official_urls:
+        discovered_lines = "\n".join(f"- {url}" for url in discovered_official_urls)
+        discovered_source_hint = (
+            "Use these exact official page URLs first before any search engine result or inferred domain:\n"
+            f"{discovered_lines}\n"
+            "Prefer the first URL if it already looks like the primary vendor or product landing page."
+        )
+    staging_subdir = _task_staging_subdir(task)
+    downloads_root = f"%USERPROFILE%\\\\Downloads\\\\computer-use-agent\\\\{staging_subdir}\\\\"
+    downloads_glob = f"~/Downloads/computer-use-agent/{staging_subdir}/*.exe"
+    install_marker_path = f"~/Downloads/computer-use-agent/{staging_subdir}/install-success.json"
+    launch_marker_path = f"~/Downloads/computer-use-agent/{staging_subdir}/launch-success.json"
     likely_install_paths = _likely_install_path_hint(keyword)
     download_title = f"Download {keyword} installer"
     install_title = f"Install {keyword}"
@@ -703,22 +947,22 @@ def _local_install_chunks(task: str, *, execution_style: str = "python_first") -
     if normalized_style == "gui_first":
         download_prompt = (
             f"Use executable Python on the Windows machine to obtain the official Windows installer `.exe` for the target app from this task: {task}. "
-            f"First inspect the current screenshot and desktop state. If a browser, search results page, official vendor page, or download control is already visible, continue from that visible UI with Python automation and download the installer into `%USERPROFILE%\\\\Downloads\\\\{downloads_subdir}\\\\`. "
+            f"First inspect the current screenshot and desktop state. If a browser, search results page, official vendor page, or download control is already visible, continue from that visible UI with Python automation and download the installer into `{downloads_root}`. "
             f"If no grounded visible UI exists yet, open the official vendor site or official release page in Python and continue there. Do not use `.zip`, portable, or archive downloads."
         )
         install_prompt = (
             f"{_matching_installer_hint(source_task=task, title=install_title, agent_prompt=task, action='실행')} "
             f"Use executable Python only. Do not download anything in this chunk. "
             f"First inspect the current screenshot and desktop state for an installer wizard, UAC prompt, license dialog, destination dialog, or completion dialog, and drive that visible UI forward if present. "
-            f"Launching only the final app executable is not enough for this chunk. If no installer UI is visible yet, find the existing installer `.exe` in `%USERPROFILE%\\\\Downloads\\\\{downloads_subdir}\\\\`, launch it once, and then continue from the resulting installer UI. "
-            f"Only after installer progression should you check likely install directories such as `{likely_install_paths}` for `{keyword}.exe`. Avoid recursively scanning the whole of `%LOCALAPPDATA%` or `%ProgramFiles%`. "
+            f"Launching only the final app executable is not enough for this chunk. If no installer UI is visible yet, find the existing installer `.exe` in `{downloads_root}`, launch it once, and then continue from the resulting installer UI. "
+            f"Only after installer progression should you check likely install directories such as `{likely_install_paths}` for the installed app executable. Avoid recursively scanning the whole of `%LOCALAPPDATA%` or `%ProgramFiles%`. "
             f"Do not import `pywin32`, `pywinauto`, `win32gui`, `win32con`, `win32api`, or `pythoncom`. Prefer the standard library, `psutil`, `pyautogui`, and `pygetwindow` only if clearly needed. "
-            f"Fail explicitly if no valid installer is found or if the install still has not produced the app executable. End only when the installed app `.exe` exists on disk."
+            f"Fail explicitly if no valid installer is found or if the install still has not produced the app executable. End only when the installed app `.exe` exists on disk and you have written `{install_marker_path}` containing the discovered executable path."
         )
     else:
         download_prompt = (
             f"Use executable Python on the Windows machine to download the official Windows installer `.exe` for the target app from this task: {task}. "
-            f"Prefer the official vendor site or official release pages, resolve the current Windows x86_64 setup `.exe` URL in Python, and save it to `%USERPROFILE%\\\\Downloads\\\\{downloads_subdir}\\\\`. "
+            f"Prefer the official vendor site or official release pages, resolve the current Windows x86_64 setup `.exe` URL in Python, and save it to `{downloads_root}`. "
             f"If one official page does not expose a raw `.exe` link, inspect another official page or official release page in the same script before failing. Do not use `.zip`, portable, or archive downloads."
         )
         install_prompt = (
@@ -726,14 +970,17 @@ def _local_install_chunks(task: str, *, execution_style: str = "python_first") -
             f"Use executable Python only. Do not download anything in this chunk. "
             f"First inspect the current screenshot and desktop state for an installer wizard, UAC prompt, license dialog, destination dialog, or completion dialog, and drive that UI forward if it is visible. "
             f"Launching only the final app executable is not enough for this chunk. If the app is not already installed, the script must either launch the installer `.exe` itself or operate a visible installer window with Python GUI automation. "
-            f"If no installer UI is visible, find the existing installer `.exe` in `%USERPROFILE%\\\\Downloads\\\\{downloads_subdir}\\\\`, launch it once, wait long enough for setup to appear or continue, and then check only likely install directories such as `{likely_install_paths}` for `{keyword}.exe`. Avoid recursively scanning the whole of `%LOCALAPPDATA%` or `%ProgramFiles%`. "
+            f"If no installer UI is visible, find the existing installer `.exe` in `{downloads_root}`, launch it once, wait long enough for setup to appear or continue, and then check only likely install directories such as `{likely_install_paths}` for the installed app executable. Avoid recursively scanning the whole of `%LOCALAPPDATA%` or `%ProgramFiles%`. "
             f"Do not import `pywin32`, `pywinauto`, `win32gui`, `win32con`, `win32api`, or `pythoncom`. Prefer the standard library, `psutil`, `pyautogui`, and `pygetwindow` only if clearly needed. "
-            f"Fail explicitly if no valid installer is found or if the install still has not produced the app executable. End only when the installed app `.exe` exists on disk."
+            f"Fail explicitly if no valid installer is found or if the install still has not produced the app executable. End only when the installed app `.exe` exists on disk and you have written `{install_marker_path}` containing the discovered executable path."
         )
+    if discovered_source_hint:
+        download_prompt = f"{download_prompt}\n\n{discovered_source_hint}"
     launch_prompt = (
         f"Use executable Python on the Windows machine to locate the already-installed app executable for the target app from this task: {task}, "
-        f"launch it once, bring the app window to the foreground if needed, and end only after the app process is running. "
-        f"Do not redownload or reinstall the app in this chunk. Prefer existing install paths under `%LOCALAPPDATA%`, `%ProgramFiles%`, and `%ProgramFiles(x86)%`, and if the app is already running just verify that process and focus the window."
+        f"prefer reading `{install_marker_path}` first if it exists, launch the app once, bring the app window to the foreground if needed, and end only after the app process is running. "
+        f"Do not redownload or reinstall the app in this chunk. Prefer existing install paths under `%LOCALAPPDATA%`, `%ProgramFiles%`, and `%ProgramFiles(x86)%`, and if the app is already running just verify that process and focus the window. "
+        f"Write `{launch_marker_path}` only after the launch succeeded."
     )
     return [
         TeacherTaskChunk(
@@ -745,15 +992,15 @@ def _local_install_chunks(task: str, *, execution_style: str = "python_first") -
                 agent_prompt=download_prompt,
                 execution_style=normalized_style,
             ),
-            success_hint=f"A target-app installer `.exe` exists in Downloads\\{downloads_subdir} and is non-empty.",
+            success_hint=f"A target-app installer `.exe` exists in `{downloads_root}` and is non-empty.",
             preconditions=[
                 "Windows desktop session is available and Python can run.",
                 "The machine has network access to the official vendor or release pages.",
             ],
             verification={
                 "checks": [
-                    {"kind": "file_exists_glob", "pattern": f"~/Downloads/{downloads_subdir}/*.exe"},
-                    {"kind": "file_size_gt", "pattern": f"~/Downloads/{downloads_subdir}/*.exe", "bytes": 1000000},
+                    {"kind": "file_exists_glob", "pattern": downloads_glob},
+                    {"kind": "file_size_gt", "pattern": downloads_glob, "bytes": 1000000},
                 ]
             },
             max_retries=1,
@@ -769,13 +1016,13 @@ def _local_install_chunks(task: str, *, execution_style: str = "python_first") -
                 agent_prompt=install_prompt,
                 execution_style=normalized_style,
             ),
-            success_hint=f"The installed app executable for `{keyword}` exists under AppData Local or another common install path.",
+            success_hint=f"The install marker `{install_marker_path}` exists and points to the installed app executable.",
             preconditions=[
-                f"A non-empty target-app installer `.exe` already exists in Downloads\\{downloads_subdir}.",
+                f"A non-empty target-app installer `.exe` already exists in `{downloads_root}`.",
             ],
             verification={
                 "checks": [
-                    {"kind": "file_exists_glob", "pattern": installed_exe_glob},
+                    {"kind": "path_exists", "path": install_marker_path},
                 ]
             },
             max_retries=2,
@@ -790,13 +1037,13 @@ def _local_install_chunks(task: str, *, execution_style: str = "python_first") -
                 agent_prompt=launch_prompt,
                 execution_style=normalized_style,
             ),
-            success_hint=f"The installed app process for `{keyword}` is running.",
+            success_hint=f"The launch marker `{launch_marker_path}` exists after the installed app was started.",
             preconditions=[
-                f"The installed app executable for `{keyword}` already exists on disk.",
+                f"The install marker `{install_marker_path}` already exists on disk.",
             ],
             verification={
                 "checks": [
-                    {"kind": "process_exists", "name": f"{keyword}.exe"},
+                    {"kind": "path_exists", "path": launch_marker_path},
                 ]
             },
             max_retries=2,
@@ -962,6 +1209,12 @@ def _normalize_chunks(
             )
         )
     if normalized:
+        if (
+            _looks_like_install_task(source_task)
+            and not _task_explicitly_requests_store(source_task)
+            and any(_looks_like_store_detour_prompt(chunk.agent_prompt) for chunk in normalized)
+        ):
+            return _local_install_chunks(source_task, execution_style=normalized_style)
         if normalized_style == "gui_first":
             normalized = _merge_gui_first_navigation_chunks(normalized)
         return normalized

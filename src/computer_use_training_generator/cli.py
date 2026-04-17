@@ -130,7 +130,9 @@ def _compose_chunk_prompt(chunk: TeacherTaskChunk, *, execution_style: str = "py
             "search results, download UI, app window, or installer dialog when that UI is already on screen. "
             "Do not ask a human to perform manual GUI actions outside the generated Python. "
             "If grounded visible browser/download/installer UI is already available, do not switch to fresh direct HTTP fetching, "
-            "HTML scraping, or silent-install shortcuts in the same step unless the latest execution proves that UI path stalled."
+            "HTML scraping, or silent-install shortcuts in the same step unless the latest execution proves that UI path stalled. "
+            "If a visible download-like or installer-like control is on screen, prefer OCR-grounded helpers such as "
+            "`click_download_like_target()` or `click_text_targets([...])` before new network-fetch logic."
         )
     else:
         prefix = (
