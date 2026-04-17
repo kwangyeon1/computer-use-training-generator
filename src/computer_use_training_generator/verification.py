@@ -17,6 +17,7 @@ _ALLOWED_CHECK_KINDS = {
     "file_exists_glob",
     "file_size_gt",
     "process_exists",
+    "json_marker_valid_exe",
 }
 
 _VERIFICATION_RETRY_DELAY_S = 2.0
@@ -69,6 +70,22 @@ def _normalize_verification_spec(verification: dict[str, object] | None) -> dict
             if not name:
                 continue
             normalized["name"] = name
+        elif kind == "json_marker_valid_exe":
+            path = str(item.get("path") or "").strip()
+            if not path:
+                continue
+            field = str(item.get("field") or "installed_exe").strip() or "installed_exe"
+            normalized["path"] = path
+            normalized["field"] = field
+            raw_keywords = item.get("keywords")
+            if isinstance(raw_keywords, list):
+                keywords = []
+                for value in raw_keywords:
+                    token = str(value or "").strip().lower()
+                    if token and token not in keywords:
+                        keywords.append(token)
+                if keywords:
+                    normalized["keywords"] = keywords
         checks.append(normalized)
     if not checks:
         return None
@@ -160,6 +177,16 @@ import re
 import subprocess
 
 CHECKS = json.loads({checks_json!r})
+SYSTEM_APP_NAMES = {{
+    "store.exe",
+    "applicationframehost.exe",
+    "explorer.exe",
+    "winget.exe",
+    "cmd.exe",
+    "powershell.exe",
+    "pwsh.exe",
+    "conhost.exe",
+}}
 
 
 def _glob_paths(pattern):
@@ -236,6 +263,67 @@ def _process_listing():
     return result.stdout.lower()
 
 
+def _normalize_keywords(values):
+    keywords = []
+    for value in values or []:
+        token = str(value or "").strip().lower()
+        if token and token not in keywords:
+            keywords.append(token)
+    return keywords
+
+
+def _looks_like_invalid_exe_path(path_text):
+    lowered = str(path_text or "").lower().replace("\\\\", "/")
+    name = os.path.basename(str(path_text or "")).lower()
+    if any(token in lowered for token in ("/temp/", "/tmp/", "/appdata/local/temp/", "/winget/")):
+        return True
+    if name in SYSTEM_APP_NAMES:
+        return True
+    if any(token in name for token in ("setup", "installer", "install", "unins", "uninstall", "update", "updater", "repair", "clicktorun", "protocolhandler")):
+        return True
+    return False
+
+
+def _validate_json_marker_exe(marker_path, field, keywords):
+    expanded_marker = os.path.expanduser(str(marker_path or ""))
+    marker = Path(expanded_marker)
+    entry = {{
+        "path": expanded_marker,
+        "field": field,
+    }}
+    if not marker.exists():
+        entry["exists"] = False
+        return False, entry
+    entry["exists"] = True
+    try:
+        payload = json.loads(marker.read_text(encoding="utf-8"))
+    except Exception as exc:
+        entry["error"] = f"invalid_json: {{exc}}"
+        return False, entry
+    raw_candidate = str((payload or {{}}).get(field) or "").strip().strip('"')
+    entry["value"] = raw_candidate
+    if not raw_candidate:
+        entry["error"] = "missing_field_value"
+        return False, entry
+    candidate = Path(os.path.expandvars(os.path.expanduser(raw_candidate)))
+    entry["resolved_path"] = str(candidate)
+    entry["candidate_exists"] = candidate.exists()
+    entry["suffix"] = candidate.suffix.lower()
+    entry["invalid_path"] = _looks_like_invalid_exe_path(str(candidate))
+    normalized_keywords = _normalize_keywords(keywords)
+    entry["keywords"] = normalized_keywords
+    keyword_hits = [keyword for keyword in normalized_keywords if keyword in str(candidate).lower()]
+    entry["keyword_hits"] = keyword_hits
+    ok = (
+        candidate.exists()
+        and candidate.is_file()
+        and candidate.suffix.lower() == ".exe"
+        and not entry["invalid_path"]
+        and (not normalized_keywords or bool(keyword_hits))
+    )
+    return ok, entry
+
+
 evidence = []
 passed = True
 
@@ -277,6 +365,12 @@ for check in CHECKS:
         ok = bool(name) and name.lower() in haystack
         entry["name"] = name
         entry["exists"] = ok
+    elif kind == "json_marker_valid_exe":
+        path = str(check.get("path") or "")
+        field = str(check.get("field") or "installed_exe")
+        keywords = check.get("keywords") or []
+        ok, marker_entry = _validate_json_marker_exe(path, field, keywords)
+        entry.update(marker_entry)
     else:
         entry["error"] = "unsupported_check_kind"
 

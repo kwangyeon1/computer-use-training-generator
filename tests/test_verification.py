@@ -15,6 +15,7 @@ from computer_use_training_generator.teacher import (
     _normalize_windows_installer_agent_prompt,
     _select_official_page_urls,
     _simplify_windows_installer_glob,
+    _task_staging_subdir,
     _target_installer_keywords,
 )
 from computer_use_training_generator.cli import _compose_chunk_prompt
@@ -70,6 +71,24 @@ def test_build_verification_code_searches_expanded_patterns() -> None:
     assert code is not None
     assert "_expanded_glob_patterns" in code
     assert 'entry["searched_patterns"] = searched_patterns' in code
+
+
+def test_build_verification_code_supports_json_marker_valid_exe() -> None:
+    code = build_verification_code(
+        {
+            "checks": [
+                {
+                    "kind": "json_marker_valid_exe",
+                    "path": "~/Downloads/computer-use-agent/example/install-success.json",
+                    "field": "installed_exe",
+                    "keywords": ["kakaotalk"],
+                }
+            ]
+        }
+    )
+    assert code is not None
+    assert "_validate_json_marker_exe" in code
+    assert 'kind == "json_marker_valid_exe"' in code
 
 
 def test_simplify_windows_installer_glob_prefers_vendor_exe_glob() -> None:
@@ -331,6 +350,7 @@ def test_build_local_teacher_fallback_for_install_task_produces_python_first_chu
     assert "If one official page does not expose a raw `.exe` link" in teacher_plan.chunks[0].agent_prompt
     assert any(check["kind"] == "file_exists_glob" for check in teacher_plan.chunks[0].verification["checks"])
     assert any(check["kind"] == "path_exists" for check in teacher_plan.chunks[1].verification["checks"])
+    assert any(check["kind"] == "json_marker_valid_exe" for check in teacher_plan.chunks[1].verification["checks"])
     assert "First inspect the current screenshot and desktop state" in teacher_plan.chunks[1].agent_prompt
     assert "Do not download anything in this chunk." in teacher_plan.chunks[1].agent_prompt
     assert "Launching only the final app executable is not enough for this chunk." in teacher_plan.chunks[1].agent_prompt
@@ -371,6 +391,37 @@ def test_build_local_teacher_fallback_for_korean_task_uses_real_app_token() -> N
     assert "카카오톡" in download_chunk.agent_prompt
     checks = download_chunk.verification["checks"]
     assert any("computer-use-agent/" in check["pattern"] and check["pattern"].endswith("/*.exe") for check in checks if check["kind"] == "file_exists_glob")
+    install_checks = teacher_plan.chunks[1].verification["checks"]
+    marker_check = next(check for check in install_checks if check["kind"] == "json_marker_valid_exe")
+    assert "카카오톡" in marker_check["keywords"]
+
+
+def test_task_staging_subdir_changes_with_session_salt() -> None:
+    task = "카카오톡 pc버전 프로그램을 설치해줘"
+    first = _task_staging_subdir(task, salt="session-a")
+    second = _task_staging_subdir(task, salt="session-b")
+    assert first != second
+    assert first
+    assert second
+
+
+def test_build_local_teacher_fallback_uses_supplied_staging_subdir() -> None:
+    _, teacher_plan = build_local_teacher_fallback(
+        task="카카오톡 pc버전 프로그램을 설치해줘",
+        prompt="dummy prompt",
+        command_template="codex exec '{prompt}'",
+        cwd="..",
+        error="teacher quota exhausted",
+        execution_style="gui_first",
+        staging_subdir="custom-stage-1234",
+    )
+    download_chunk = teacher_plan.chunks[0]
+    assert "custom-stage-1234" in download_chunk.agent_prompt
+    assert any(
+        check.get("pattern") == "~/Downloads/computer-use-agent/custom-stage-1234/*.exe"
+        for check in download_chunk.verification["checks"]
+        if check["kind"] == "file_exists_glob"
+    )
 
 
 def test_build_local_teacher_fallback_injects_discovered_official_page_urls() -> None:
@@ -392,6 +443,10 @@ def test_build_local_teacher_fallback_injects_discovered_official_page_urls() ->
     download_chunk = teacher_plan.chunks[0]
     assert "Use these exact official page URLs first before any search engine result or inferred domain:" in download_chunk.agent_prompt
     assert "https://www.kakaocorp.com/page/service/service/KakaoTalk?lang=ko" in download_chunk.agent_prompt
+    install_marker_check = next(
+        check for check in teacher_plan.chunks[1].verification["checks"] if check["kind"] == "json_marker_valid_exe"
+    )
+    assert "kakaotalk" in install_marker_check["keywords"]
 
 
 def test_normalize_chunks_replaces_store_detour_plan_for_windows_installer_task() -> None:

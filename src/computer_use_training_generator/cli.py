@@ -13,6 +13,7 @@ from .agent import bootstrap_agent, run_agent_prompt
 from .collector import (
     append_run_artifacts,
     collect_run_artifacts,
+    make_session_id,
     prepare_session_root,
     write_agent_invocation_payload,
     write_session_manifest,
@@ -20,7 +21,7 @@ from .collector import (
 )
 from .config_utils import load_generator_config
 from .models import TeacherChunkPlanResult, TeacherTaskChunk
-from .teacher import build_local_teacher_fallback, run_teacher, split_teacher_response
+from .teacher import _task_staging_subdir, build_local_teacher_fallback, run_teacher, split_teacher_response
 from .verification import run_chunk_verification, write_verification_artifact
 
 
@@ -132,7 +133,9 @@ def _compose_chunk_prompt(chunk: TeacherTaskChunk, *, execution_style: str = "py
             "If grounded visible browser/download/installer UI is already available, do not switch to fresh direct HTTP fetching, "
             "HTML scraping, or silent-install shortcuts in the same step unless the latest execution proves that UI path stalled. "
             "If a visible download-like or installer-like control is on screen, prefer OCR-grounded helpers such as "
-            "`click_download_like_target()` or `click_text_targets([...])` before new network-fetch logic."
+            "`click_download_like_target()` or `click_text_targets([...])` before new network-fetch logic. "
+            "If the page looks like a collapsed or responsive header menu layout and the download control is not visible yet, "
+            "prefer `open_responsive_header_menu()` before fresh network discovery."
         )
     else:
         prefix = (
@@ -148,12 +151,66 @@ def _compose_chunk_prompt(chunk: TeacherTaskChunk, *, execution_style: str = "py
     return "\n\n".join(part for part in parts if part)
 
 
+def _extract_verified_installer_paths(verification_result: dict | None) -> list[str]:
+    if not verification_result:
+        return []
+    evidence = verification_result.get("evidence") or []
+    results: list[str] = []
+    seen: set[str] = set()
+    for entry in evidence:
+        if not isinstance(entry, dict):
+            continue
+        kind = str(entry.get("kind") or "")
+        if kind not in {"path_exists", "file_exists_glob", "file_size_gt"}:
+            continue
+        candidates: list[str] = []
+        path_value = str(entry.get("path") or "").strip()
+        pattern_value = str(entry.get("pattern") or "").strip()
+        if path_value:
+            candidates.append(path_value)
+        if pattern_value.endswith(".exe") and "*" not in pattern_value:
+            candidates.append(pattern_value)
+        matches = entry.get("matches") or []
+        if isinstance(matches, list):
+            for match in matches:
+                if isinstance(match, dict):
+                    candidate = str(match.get("path") or "").strip()
+                else:
+                    candidate = str(match or "").strip()
+                if candidate:
+                    candidates.append(candidate)
+        for candidate in candidates:
+            normalized = candidate.replace("\\", "/").rstrip()
+            if not normalized.lower().endswith(".exe"):
+                continue
+            lowered = normalized.lower()
+            if lowered in seen:
+                continue
+            seen.add(lowered)
+            results.append(candidate)
+    return results
+
+
+def _append_verified_installer_hint(prompt_text: str, verification_result: dict | None) -> str:
+    installer_paths = _extract_verified_installer_paths(verification_result)
+    if not installer_paths:
+        return prompt_text
+    details = "\n".join(f"- `{path}`" for path in installer_paths[:3])
+    hint = (
+        "Previously verified installer artifacts on the target machine. Prefer these exact installer paths before "
+        "searching Downloads broadly again:\n"
+        f"{details}"
+    )
+    return prompt_text + "\n\n" + hint
+
+
 def _compose_retry_prompt(
     *,
     chunk: TeacherTaskChunk,
     verification_result: dict,
     attempt_index: int,
     execution_style: str = "python_first",
+    prior_verification_result: dict | None = None,
 ) -> str:
     evidence = verification_result.get("evidence")
     error = verification_result.get("error")
@@ -163,7 +220,9 @@ def _compose_retry_prompt(
     if error:
         details.append(f"Verifier error: {error}")
     details.append(f"Verifier evidence:\n{evidence_text}")
-    return _compose_chunk_prompt(chunk, execution_style=execution_style) + "\n\n" + "\n\n".join(details)
+    prompt_text = _compose_chunk_prompt(chunk, execution_style=execution_style)
+    prompt_text = _append_verified_installer_hint(prompt_text, prior_verification_result)
+    return prompt_text + "\n\n" + "\n\n".join(details)
 
 
 def _teacher_execution_style_context(execution_style: str) -> str:
@@ -316,6 +375,13 @@ $flags = $SWP_NOMOVE -bor $SWP_NOSIZE -bor $SWP_SHOWWINDOW -bor $SWP_NOACTIVATE
 
 def cmd_run_session(args: argparse.Namespace) -> int:
     config, _ = _build_effective_config(args)
+    session_id = make_session_id(args.task)
+    session_id, session_root = prepare_session_root(
+        output_dir=str(config["output_dir"]),
+        task=args.task,
+        session_id=session_id,
+    )
+    local_fallback_staging_subdir = _task_staging_subdir(args.task, salt=session_id)
     teacher_prompt = args.teacher_prompt or _compose_teacher_prompt(task=args.task, config=config)
     teacher_command_template = str(config.get("teacher_command_template", ""))
     teacher_workdir = config.get("teacher_workdir")
@@ -365,9 +431,8 @@ def cmd_run_session(args: argparse.Namespace) -> int:
             cwd=teacher_workdir,
             error=str(exc),
             execution_style=execution_style,
+            staging_subdir=local_fallback_staging_subdir,
         )
-
-    session_id, session_root = prepare_session_root(output_dir=str(config["output_dir"]), task=args.task)
     write_teacher_bundle(
         session_root=session_root,
         teacher_prompt=teacher_prompt,
@@ -417,6 +482,7 @@ def cmd_run_session(args: argparse.Namespace) -> int:
     total_chunks = len(teacher_plan.chunks)
     stopped_reason: str | None = None
     chunk_verification_enabled = bool(config.get("chunk_verification_enabled", True))
+    previous_chunk_verification_result: dict | None = None
     for chunk_index, chunk in enumerate(teacher_plan.chunks, start=1):
         attempt_index = 0
         chunk_completed = False
@@ -449,12 +515,14 @@ def cmd_run_session(args: argparse.Namespace) -> int:
                 break
             attempts_used += 1
             prompt_text = _compose_chunk_prompt(chunk, execution_style=execution_style)
+            prompt_text = _append_verified_installer_hint(prompt_text, previous_chunk_verification_result)
             if attempt_index > 0 and final_verification_result is not None:
                 prompt_text = _compose_retry_prompt(
                     chunk=chunk,
                     verification_result=final_verification_result,
                     attempt_index=attempt_index,
                     execution_style=execution_style,
+                    prior_verification_result=previous_chunk_verification_result,
                 )
             prompt_result = run_agent_prompt(
                 agent_command=str(config["agent_command"]),
@@ -551,6 +619,7 @@ def cmd_run_session(args: argparse.Namespace) -> int:
         )
         if not chunk_completed:
             break
+        previous_chunk_verification_result = final_verification_result
 
     completed_chunks = len(chunk_results)
     for remaining_index, chunk in enumerate(teacher_plan.chunks[completed_chunks:], start=completed_chunks + 1):

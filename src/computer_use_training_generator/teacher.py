@@ -492,12 +492,14 @@ def _execution_style_guidance(execution_style: str) -> str:
             "- Keep all steps executable in Python, but when the screenshot or current state already shows a browser page, search results, "
             "download control, installer wizard, or target app window, prefer continuing from that visible UI.\n"
             "- If a visible download-like or installer-like control is on screen, prefer OCR-grounded click helpers before HTML scraping or fresh HTTP fetching.\n"
-            "- Do not force direct download or silent install shortcuts when grounded visible UI progression is the safer next step."
+            "- Do not force direct download or silent install shortcuts when grounded visible UI progression is the safer next step.\n"
+            "- For desktop software installation tasks, do not route through Microsoft Store, app stores, or package managers unless the task explicitly asks for that source. Prefer direct official vendor pages or direct official `.exe` installers."
         )
     return (
         "- Execution style for this planning run: `python_first`.\n"
         "- Prefer deterministic Python-first flows such as direct official URL discovery, direct file download, file/process checks, and "
-        "silent or subprocess-based install/launch before browser-click-heavy flows."
+        "silent or subprocess-based install/launch before browser-click-heavy flows.\n"
+        "- For desktop software installation tasks, do not route through Microsoft Store, app stores, or package managers unless the task explicitly asks for that source. Prefer direct official vendor pages or direct official `.exe` installers."
     )
 
 
@@ -606,12 +608,35 @@ def _likely_install_path_hint(keyword: str) -> str:
     )
 
 
-def _task_staging_subdir(task: str) -> str:
+def _downloads_installer_glob(task: str, *parts: str) -> str | None:
+    keywords = _target_installer_keywords(task, *parts, limit=6)
+    if not keywords:
+        return None
+    filename_like_ascii = []
+    fallback_ascii = []
+    avoid_ascii_tokens = {"corp", "company", "service", "detail", "page", "lang", "release", "download"}
+    for keyword in keywords:
+        if re.search(r"[a-z]", keyword) is None:
+            continue
+        lowered = keyword.lower()
+        if lowered in avoid_ascii_tokens or lowered.endswith("corp"):
+            fallback_ascii.append(keyword)
+            continue
+        filename_like_ascii.append(keyword)
+    preferred = (filename_like_ascii or fallback_ascii or keywords)[0]
+    token = re.sub(r"[^0-9A-Za-z가-힣]+", "", str(preferred or "")).strip()
+    if not token:
+        return None
+    return f"~/Downloads/*{token}*.exe"
+
+
+def _task_staging_subdir(task: str, *, salt: str | None = None) -> str:
     keywords = _target_installer_keywords(task, limit=2)
     ascii_parts = [re.sub(r"[^a-z0-9]+", "", keyword.lower()) for keyword in keywords]
     ascii_parts = [part for part in ascii_parts if part]
     prefix = "-".join(ascii_parts[:2]) or "targetapp"
-    digest = hashlib.sha1(str(task or "").encode("utf-8")).hexdigest()[:8]
+    digest_source = f"{task or ''}::{salt or ''}"
+    digest = hashlib.sha1(digest_source.encode("utf-8")).hexdigest()[:8]
     return f"{prefix}-{digest}"
 
 
@@ -813,6 +838,7 @@ def _normalize_windows_installer_agent_prompt(
         "현재 화면에 근거가 없을 때만 새 페이지를 여세요. "
         "근거 있는 visible browser/download UI가 이미 있으면 그 chunk 안에서 새 urllib/requests HTML scraping이나 fresh direct fetch로 갈아타지 말고, 먼저 그 UI를 끝까지 진행하세요. "
         "보이는 download/install control 이 있으면 OCR-grounded helper 예를 들어 `click_download_like_target()` 또는 `click_text_targets([...])` 같은 helper를 우선 고려하세요. "
+        "responsive/mobile header menu 때문에 download control 이 아직 안 보이면 `open_responsive_header_menu()` 같은 helper로 그 visible menu를 먼저 여는 쪽을 우선하세요. "
         "여전히 공식 vendor source를 우선하고 `.zip`이나 archive가 아니라 Windows installer `.exe`를 선택하세요."
     )
     gui_install_hint = (
@@ -923,10 +949,19 @@ def _normalize_general_gui_agent_prompt(
     return f"{raw}\n\n{continue_hint}"
 
 
-def _local_install_chunks(task: str, *, execution_style: str = "python_first") -> list[TeacherTaskChunk]:
+def _local_install_chunks(
+    task: str,
+    *,
+    execution_style: str = "python_first",
+    staging_subdir: str | None = None,
+) -> list[TeacherTaskChunk]:
     normalized_style = _normalize_execution_style(execution_style)
     keyword = (_target_installer_keywords(task, limit=1) or ["targetapp"])[0]
     discovered_official_urls = _discover_official_page_urls(task, limit=2)
+    if not _task_explicitly_requests_store(task):
+        non_store_urls = [url for url in discovered_official_urls if "apps.microsoft.com" not in str(url).lower()]
+        if non_store_urls:
+            discovered_official_urls = non_store_urls
     discovered_source_hint = ""
     if discovered_official_urls:
         discovered_lines = "\n".join(f"- {url}" for url in discovered_official_urls)
@@ -935,9 +970,18 @@ def _local_install_chunks(task: str, *, execution_style: str = "python_first") -
             f"{discovered_lines}\n"
             "Prefer the first URL if it already looks like the primary vendor or product landing page."
         )
-    staging_subdir = _task_staging_subdir(task)
-    downloads_root = f"%USERPROFILE%\\\\Downloads\\\\computer-use-agent\\\\{staging_subdir}\\\\"
-    downloads_glob = f"~/Downloads/computer-use-agent/{staging_subdir}/*.exe"
+    target_keywords: list[str] = []
+    for token in _target_installer_keywords(task, *discovered_official_urls, limit=6):
+        if token not in target_keywords:
+            target_keywords.append(token)
+    staging_subdir = str(staging_subdir or _task_staging_subdir(task)).strip()
+    keyword_download_glob = _downloads_installer_glob(task, *discovered_official_urls)
+    if keyword_download_glob:
+        downloads_root = "%USERPROFILE%\\\\Downloads\\\\"
+        downloads_glob = keyword_download_glob
+    else:
+        downloads_root = f"%USERPROFILE%\\\\Downloads\\\\computer-use-agent\\\\{staging_subdir}\\\\"
+        downloads_glob = f"~/Downloads/computer-use-agent/{staging_subdir}/*.exe"
     install_marker_path = f"~/Downloads/computer-use-agent/{staging_subdir}/install-success.json"
     launch_marker_path = f"~/Downloads/computer-use-agent/{staging_subdir}/launch-success.json"
     likely_install_paths = _likely_install_path_hint(keyword)
@@ -1023,6 +1067,12 @@ def _local_install_chunks(task: str, *, execution_style: str = "python_first") -
             verification={
                 "checks": [
                     {"kind": "path_exists", "path": install_marker_path},
+                    {
+                        "kind": "json_marker_valid_exe",
+                        "path": install_marker_path,
+                        "field": "installed_exe",
+                        "keywords": target_keywords,
+                    },
                 ]
             },
             max_retries=2,
@@ -1061,6 +1111,7 @@ def build_local_teacher_fallback(
     cwd: str | None,
     error: str,
     execution_style: str = "python_first",
+    staging_subdir: str | None = None,
 ) -> tuple[TeacherResult, TeacherChunkPlanResult]:
     normalized_style = _normalize_execution_style(execution_style)
     command_result = _fallback_command_result(
@@ -1078,7 +1129,11 @@ def build_local_teacher_fallback(
         )
     )
     if _looks_like_install_task(task):
-        chunks = _local_install_chunks(task, execution_style=normalized_style)
+        chunks = _local_install_chunks(
+            task,
+            execution_style=normalized_style,
+            staging_subdir=staging_subdir,
+        )
     else:
         chunks = [
             TeacherTaskChunk(
