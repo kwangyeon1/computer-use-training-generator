@@ -389,8 +389,9 @@ def test_build_local_teacher_fallback_for_korean_task_uses_real_app_token() -> N
     download_chunk = teacher_plan.chunks[0]
     assert "Targetapp" not in download_chunk.agent_prompt
     assert "카카오톡" in download_chunk.agent_prompt
+    assert "computer-use-agent-context.json" in download_chunk.agent_prompt
     checks = download_chunk.verification["checks"]
-    assert any("computer-use-agent/" in check["pattern"] and check["pattern"].endswith("/*.exe") for check in checks if check["kind"] == "file_exists_glob")
+    assert any(check["pattern"] == "~/Downloads/*kakaotalk*.exe" for check in checks if check["kind"] == "file_exists_glob")
     install_checks = teacher_plan.chunks[1].verification["checks"]
     marker_check = next(check for check in install_checks if check["kind"] == "json_marker_valid_exe")
     assert "카카오톡" in marker_check["keywords"]
@@ -416,9 +417,10 @@ def test_build_local_teacher_fallback_uses_supplied_staging_subdir() -> None:
         staging_subdir="custom-stage-1234",
     )
     download_chunk = teacher_plan.chunks[0]
-    assert "custom-stage-1234" in download_chunk.agent_prompt
+    assert "computer-use-agent-context.json" in download_chunk.agent_prompt
+    assert "custom-stage-1234" not in download_chunk.agent_prompt
     assert any(
-        check.get("pattern") == "~/Downloads/computer-use-agent/custom-stage-1234/*.exe"
+        check.get("pattern") == "~/Downloads/*kakaotalk*.exe"
         for check in download_chunk.verification["checks"]
         if check["kind"] == "file_exists_glob"
     )
@@ -491,3 +493,34 @@ def test_normalize_chunks_keeps_store_plan_when_task_explicitly_requests_store()
     )
     assert len(chunks) == 1
     assert "apps.microsoft.com" in chunks[0].agent_prompt.lower()
+
+
+def test_normalize_chunks_prioritizes_install_marker_verifier_for_installer_run_prompt() -> None:
+    chunks = _normalize_chunks(
+        {
+            "chunks": [
+                {
+                    "chunk_id": "chunk-001",
+                    "title": "Run KakaoTalk installer",
+                    "agent_prompt": (
+                        "Use Python to launch the KakaoTalk installer `.exe` that was downloaded in `~/Downloads`, "
+                        "then drive the Windows installer wizard to completion with default options. "
+                        "If a Windows UAC or permission prompt appears, approve it so the installation can proceed."
+                    ),
+                    "verification": {
+                        "checks": [
+                            {"kind": "path_exists", "path": "C:/Program Files/KakaoTalk"},
+                            {"kind": "process_exists", "name": "KakaoTalk.exe"},
+                        ]
+                    },
+                }
+            ]
+        },
+        source_task="카카오톡 pc버전 프로그램을 설치해줘",
+        source_text="teacher text",
+        execution_style="gui_first",
+    )
+    checks = chunks[0].verification["checks"]
+    assert checks[0]["path"] == "~/Downloads/install-success.json"
+    assert checks[1]["kind"] == "json_marker_valid_exe"
+    assert checks[1]["field"] == "installed_exe"

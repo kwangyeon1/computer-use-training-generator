@@ -727,10 +727,69 @@ def _chunk_has_verification_kind(chunk: TeacherTaskChunk, *kinds: str) -> bool:
     return False
 
 
+def _verification_has_kind(verification: dict | None, *kinds: str) -> bool:
+    checks = (verification or {}).get("checks")
+    if not isinstance(checks, list):
+        return False
+    expected = {str(kind).strip() for kind in kinds if str(kind).strip()}
+    for item in checks:
+        if not isinstance(item, dict):
+            continue
+        if str(item.get("kind") or "").strip() in expected:
+            return True
+    return False
+
+
 def _looks_like_download_chunk(title: str, agent_prompt: str) -> bool:
     combined = f"{title}\n{agent_prompt}".lower()
+    install_like_markers = (
+        "launch the downloaded",
+        "launch the installer",
+        "launch the ",
+        "run installer",
+        "run the installer",
+        "run the downloaded",
+        "execute the installer",
+        "installer wizard",
+        "drive the windows installer",
+        "drive the installer",
+        "uac prompt",
+        "uac or permission prompt",
+        "permission prompt",
+        "설치 파일 실행",
+        "설치 마법사",
+        "설치 관리자",
+        "설치 진행",
+        "설치 완료",
+        "설치 후",
+        "다운로드된",
+    )
+    if any(token in combined for token in install_like_markers):
+        return False
+    if any(
+        token in combined
+        for token in (
+            "subprocess",
+        )
+    ):
+        return False
+    download_markers = (
+        "download",
+        "다운로드",
+        "save into",
+        "save it into",
+        "save to",
+        "fetch first",
+        "resolve the actual",
+        "resolve the installer",
+        "downloaded installer artifact",
+        "downloads folder",
+        "download completed",
+        "windows installer `.exe` only",
+        "installer `.exe` only",
+    )
     return ".exe" in combined and any(
-        token in combined for token in ("download", "다운로드", "installer", "setup", "downloads folder")
+        token in combined for token in download_markers
     )
 
 
@@ -755,6 +814,90 @@ def _looks_like_navigation_only_chunk(chunk: TeacherTaskChunk) -> bool:
         "공식 페이지",
     )
     return any(marker in combined for marker in navigation_markers)
+
+
+def _looks_like_install_execution_chunk(title: str, agent_prompt: str) -> bool:
+    combined = f"{title}\n{agent_prompt}".lower()
+    if any(token in combined for token in ("login screen", "로그인 화면", "launch marker", "start menu", "foreground")):
+        return False
+    install_run_markers = (
+        "launch the downloaded",
+        "launch the installer",
+        "run installer",
+        "run the installer",
+        "execute the installer",
+        "installer wizard",
+        "uac prompt",
+        "uac or permission prompt",
+        "permission prompt",
+        "approve it",
+        "complete the installation",
+        "complete the setup",
+        "finish install",
+        "finish setup",
+        "drive the windows installer",
+        "drive the installer",
+        "설치 파일 실행",
+        "설치 마법사",
+        "설치 관리자",
+        "설치 진행",
+        "설치 완료",
+        "권한 창",
+        "실행",
+    )
+    if (
+        any(token in combined for token in ("download the", "download installer", "download the windows installer", "다운로드"))
+        and not any(marker in combined for marker in install_run_markers)
+    ):
+        return False
+    return ".exe" in combined and any(
+        token in combined
+        for token in (
+            "launch the downloaded",
+            "launch the installer",
+            "run installer",
+            "run the installer",
+            "execute the installer",
+            "installer wizard",
+            "uac prompt",
+            "uac or permission prompt",
+            "permission prompt",
+            "approve it",
+            "complete the installation",
+            "complete the setup",
+            "finish install",
+            "finish setup",
+            "drive the windows installer",
+            "drive the installer",
+            "설치 파일 실행",
+            "설치 마법사",
+            "설치 관리자",
+            "설치 진행",
+            "설치 완료",
+            "권한 창",
+            "설치",
+        )
+    )
+
+
+def _looks_like_launch_execution_chunk(title: str, agent_prompt: str) -> bool:
+    combined = f"{title}\n{agent_prompt}".lower()
+    if ".exe" in combined and any(token in combined for token in ("installer", "setup", "run installer", "launch the downloaded")):
+        return False
+    return any(
+        token in combined
+        for token in (
+            "launch the app",
+            "launch the installed app",
+            "login screen",
+            "로그인 화면",
+            "start menu",
+            "foreground",
+            "already running",
+            "running",
+            "launch marker",
+        )
+    )
 
 
 def _merge_gui_first_navigation_chunks(chunks: list[TeacherTaskChunk]) -> list[TeacherTaskChunk]:
@@ -979,11 +1122,15 @@ def _local_install_chunks(
     if keyword_download_glob:
         downloads_root = "%USERPROFILE%\\\\Downloads\\\\"
         downloads_glob = keyword_download_glob
+        install_marker_path = "~/Downloads/install-success.json"
+        launch_marker_path = "~/Downloads/launch-success.json"
+        context_path = "~/Downloads/computer-use-agent-context.json"
     else:
         downloads_root = f"%USERPROFILE%\\\\Downloads\\\\computer-use-agent\\\\{staging_subdir}\\\\"
         downloads_glob = f"~/Downloads/computer-use-agent/{staging_subdir}/*.exe"
-    install_marker_path = f"~/Downloads/computer-use-agent/{staging_subdir}/install-success.json"
-    launch_marker_path = f"~/Downloads/computer-use-agent/{staging_subdir}/launch-success.json"
+        install_marker_path = f"~/Downloads/computer-use-agent/{staging_subdir}/install-success.json"
+        launch_marker_path = f"~/Downloads/computer-use-agent/{staging_subdir}/launch-success.json"
+        context_path = f"~/Downloads/computer-use-agent/{staging_subdir}/computer-use-agent-context.json"
     likely_install_paths = _likely_install_path_hint(keyword)
     download_title = f"Download {keyword} installer"
     install_title = f"Install {keyword}"
@@ -992,39 +1139,51 @@ def _local_install_chunks(
         download_prompt = (
             f"Use executable Python on the Windows machine to obtain the official Windows installer `.exe` for the target app from this task: {task}. "
             f"First inspect the current screenshot and desktop state. If a browser, search results page, official vendor page, or download control is already visible, continue from that visible UI with Python automation and download the installer into `{downloads_root}`. "
-            f"If no grounded visible UI exists yet, open the official vendor site or official release page in Python and continue there. Do not use `.zip`, portable, or archive downloads."
+            f"If no grounded visible UI exists yet, open the official vendor site or official release page in Python and continue there. "
+            f"If the soft continuity file `{context_path}` already points to a valid installer for this task and that file still exists, you may reuse it instead of downloading again, but validate it before trusting it. "
+            f"If you confirm or obtain a valid installer, update `{context_path}` with the exact installer path so later chunks can continue from it. "
+            f"Do not use `.zip`, portable, or archive downloads."
         )
         install_prompt = (
             f"{_matching_installer_hint(source_task=task, title=install_title, agent_prompt=task, action='실행')} "
             f"Use executable Python only. Do not download anything in this chunk. "
             f"First inspect the current screenshot and desktop state for an installer wizard, UAC prompt, license dialog, destination dialog, or completion dialog, and drive that visible UI forward if present. "
-            f"Launching only the final app executable is not enough for this chunk. If no installer UI is visible yet, find the existing installer `.exe` in `{downloads_root}`, launch it once, and then continue from the resulting installer UI. "
+            f"Launching only the final app executable is not enough for this chunk. "
+            f"Prefer reading the soft continuity file `{context_path}` first; if it names a valid installer path for this task, reuse that exact path instead of searching Downloads broadly, but ignore it if validation fails. "
+            f"If no installer UI is visible yet, find the existing installer `.exe` in `{downloads_root}`, launch it once, and then continue from the resulting installer UI. "
             f"Only after installer progression should you check likely install directories such as `{likely_install_paths}` for the installed app executable. Avoid recursively scanning the whole of `%LOCALAPPDATA%` or `%ProgramFiles%`. "
             f"Do not import `pywin32`, `pywinauto`, `win32gui`, `win32con`, `win32api`, or `pythoncom`. Prefer the standard library, `psutil`, `pyautogui`, and `pygetwindow` only if clearly needed. "
-            f"Fail explicitly if no valid installer is found or if the install still has not produced the app executable. End only when the installed app `.exe` exists on disk and you have written `{install_marker_path}` containing the discovered executable path."
+            f"Fail explicitly if no valid installer is found or if the install still has not produced the app executable. "
+            f"End only when the installed app `.exe` exists on disk, `{install_marker_path}` contains the discovered executable path, and `{context_path}` is updated with the same installed executable."
         )
     else:
         download_prompt = (
             f"Use executable Python on the Windows machine to download the official Windows installer `.exe` for the target app from this task: {task}. "
             f"Prefer the official vendor site or official release pages, resolve the current Windows x86_64 setup `.exe` URL in Python, and save it to `{downloads_root}`. "
-            f"If one official page does not expose a raw `.exe` link, inspect another official page or official release page in the same script before failing. Do not use `.zip`, portable, or archive downloads."
+            f"If the soft continuity file `{context_path}` already points to a valid installer for this task and that file still exists, you may reuse it instead of downloading again, but validate it before trusting it. "
+            f"If one official page does not expose a raw `.exe` link, inspect another official page or official release page in the same script before failing. "
+            f"After you confirm or obtain a valid installer, update `{context_path}` with the exact installer path. "
+            f"Do not use `.zip`, portable, or archive downloads."
         )
         install_prompt = (
             f"{_matching_installer_hint(source_task=task, title=install_title, agent_prompt=task, action='실행')} "
             f"Use executable Python only. Do not download anything in this chunk. "
             f"First inspect the current screenshot and desktop state for an installer wizard, UAC prompt, license dialog, destination dialog, or completion dialog, and drive that UI forward if it is visible. "
-            f"Launching only the final app executable is not enough for this chunk. If the app is not already installed, the script must either launch the installer `.exe` itself or operate a visible installer window with Python GUI automation. "
+            f"Launching only the final app executable is not enough for this chunk. "
+            f"Prefer reading the soft continuity file `{context_path}` first; if it names a valid installer path for this task, reuse that exact path instead of searching Downloads broadly, but ignore it if validation fails. "
+            f"If the app is not already installed, the script must either launch the installer `.exe` itself or operate a visible installer window with Python GUI automation. "
             f"If no installer UI is visible, find the existing installer `.exe` in `{downloads_root}`, launch it once, wait long enough for setup to appear or continue, and then check only likely install directories such as `{likely_install_paths}` for the installed app executable. Avoid recursively scanning the whole of `%LOCALAPPDATA%` or `%ProgramFiles%`. "
             f"Do not import `pywin32`, `pywinauto`, `win32gui`, `win32con`, `win32api`, or `pythoncom`. Prefer the standard library, `psutil`, `pyautogui`, and `pygetwindow` only if clearly needed. "
-            f"Fail explicitly if no valid installer is found or if the install still has not produced the app executable. End only when the installed app `.exe` exists on disk and you have written `{install_marker_path}` containing the discovered executable path."
+            f"Fail explicitly if no valid installer is found or if the install still has not produced the app executable. "
+            f"End only when the installed app `.exe` exists on disk, `{install_marker_path}` contains the discovered executable path, and `{context_path}` is updated with the same installed executable."
         )
     if discovered_source_hint:
         download_prompt = f"{download_prompt}\n\n{discovered_source_hint}"
     launch_prompt = (
         f"Use executable Python on the Windows machine to locate the already-installed app executable for the target app from this task: {task}, "
-        f"prefer reading `{install_marker_path}` first if it exists, launch the app once, bring the app window to the foreground if needed, and end only after the app process is running. "
+        f"prefer reading `{install_marker_path}` and the soft continuity file `{context_path}` first if they exist, launch the app once, bring the app window to the foreground if needed, and end only after the app process is running. "
         f"Do not redownload or reinstall the app in this chunk. Prefer existing install paths under `%LOCALAPPDATA%`, `%ProgramFiles%`, and `%ProgramFiles(x86)%`, and if the app is already running just verify that process and focus the window. "
-        f"Write `{launch_marker_path}` only after the launch succeeded."
+        f"Write `{launch_marker_path}` only after the launch succeeded, and update `{context_path}` with the launched executable path."
     )
     return [
         TeacherTaskChunk(
@@ -1094,6 +1253,12 @@ def _local_install_chunks(
             verification={
                 "checks": [
                     {"kind": "path_exists", "path": launch_marker_path},
+                    {
+                        "kind": "json_marker_valid_exe",
+                        "path": launch_marker_path,
+                        "field": "launched_exe",
+                        "keywords": target_keywords,
+                    },
                 ]
             },
             max_retries=2,
@@ -1240,6 +1405,35 @@ def _normalize_chunks(
             agent_prompt=agent_prompt,
             verification=verification,
         )
+        target_keywords = _target_installer_keywords(source_task, title, agent_prompt, limit=6)
+        if _looks_like_install_task(source_task):
+            if (
+                _looks_like_install_execution_chunk(title, agent_prompt)
+                and not _verification_has_kind(verification, "json_marker_valid_exe")
+            ):
+                verification = {
+                    "checks": [
+                        {"kind": "path_exists", "path": "~/Downloads/install-success.json"},
+                        {
+                            "kind": "json_marker_valid_exe",
+                            "path": "~/Downloads/install-success.json",
+                            "field": "installed_exe",
+                            "keywords": target_keywords,
+                        },
+                    ]
+                }
+            elif _looks_like_launch_execution_chunk(title, agent_prompt) and not _verification_has_kind(verification, "json_marker_valid_exe"):
+                verification = {
+                    "checks": [
+                        {"kind": "path_exists", "path": "~/Downloads/launch-success.json"},
+                        {
+                            "kind": "json_marker_valid_exe",
+                            "path": "~/Downloads/launch-success.json",
+                            "field": "launched_exe",
+                            "keywords": target_keywords,
+                        },
+                    ]
+                }
         raw_max_retries = item.get("max_retries")
         try:
             max_retries = int(raw_max_retries) if raw_max_retries is not None else (1 if verification else 0)
