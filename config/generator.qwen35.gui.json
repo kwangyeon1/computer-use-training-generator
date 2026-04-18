@@ -1,0 +1,20 @@
+{
+  "teacher_command_template": "codex exec -m gpt-5.4-mini -c model_reasoning_effort=\"low\" \"{prompt}\"",
+  "teacher_timeout_s": 60,
+  "teacher_split_enabled": true,
+  "teacher_split_timeout_s": 60,
+  "teacher_workdir": "..",
+  "execution_style": "gui_first",
+  "teacher_task_context": "You are planning actions for a remote Windows desktop controlled by a computer-use agent through an executor endpoint. Do not answer based on your own local Codex CLI sandbox limitations. Assume the agent can inspect screenshots and control GUI apps, browsers, files, downloads, installers, and subprocesses on the target Windows machine by generating executable Python code. Provide actionable guidance for that target Windows machine only. Plan for screenshot-aware GUI-first automation, not for a human manually clicking outside the generated Python. When a browser page, search results page, official vendor page, installer dialog, or target app window is already visible, prefer continuing from that visible UI state with Python GUI automation. For software installation tasks, prefer official vendor sources and the official Windows installer .exe, not zip or portable archive builds, unless the task explicitly requests another format. Produce steps that can verify download completion and installation success on Windows.",
+  "chunk_verification_enabled": true,
+  "chunk_verification_timeout_s": 60,
+  "agent_command": "../../computer-use-raw-python-agent/.venv/bin/qwen-computer-use-agent",
+  "agent_model_id": "../../models/Qwen3.5-9B",
+  "agent_config_path": "../../computer-use-raw-python-agent/config/agent.default.json",
+  "agent_endpoint": "http://127.0.0.1:8790",
+  "agent_reasoning_enabled": false,
+  "agent_workdir": "../../computer-use-raw-python-agent",
+  "agent_bootstrap_timeout_s": 600,
+  "agent_prompt_timeout_s": 1800,
+  "output_dir": "../data/sessions"
+}

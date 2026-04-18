@@ -1,13 +1,23 @@
+from unittest.mock import patch
+
 from computer_use_training_generator.verification import (
     _expanded_glob_patterns,
     _has_file_based_checks,
     build_verification_code,
 )
 from computer_use_training_generator.teacher import (
+    _decode_bing_result_url,
+    _extract_bing_result_candidates,
+    _looks_like_install_execution_chunk,
+    _merge_gui_first_navigation_chunks,
+    _normalize_chunks,
     build_local_teacher_fallback,
     _normalize_general_gui_agent_prompt,
     _normalize_windows_installer_agent_prompt,
+    _select_official_page_urls,
     _simplify_windows_installer_glob,
+    _task_staging_subdir,
+    _target_installer_keywords,
 )
 from computer_use_training_generator.cli import _compose_chunk_prompt
 from computer_use_training_generator.models import TeacherTaskChunk
@@ -64,6 +74,32 @@ def test_build_verification_code_searches_expanded_patterns() -> None:
     assert 'entry["searched_patterns"] = searched_patterns' in code
 
 
+def test_build_verification_code_supports_json_marker_valid_exe() -> None:
+    code = build_verification_code(
+        {
+            "checks": [
+                {
+                    "kind": "json_marker_valid_exe",
+                    "path": "~/Downloads/computer-use-agent/example/install-success.json",
+                    "field": "installed_exe",
+                    "keywords": ["kakaotalk"],
+                }
+            ]
+        }
+    )
+    assert code is not None
+    assert "_validate_json_marker_exe" in code
+
+
+def test_install_execution_chunk_does_not_match_download_stage_prompt() -> None:
+    prompt = (
+        "Use executable Python on the Windows machine to download the official Windows installer `.exe` "
+        "and save it to Downloads. If the download finishes, log the filename and confirm temporary "
+        "download extensions disappeared."
+    )
+    assert _looks_like_install_execution_chunk("Download targetapp installer", prompt) is False
+
+
 def test_simplify_windows_installer_glob_prefers_vendor_exe_glob() -> None:
     assert (
         _simplify_windows_installer_glob("~/Downloads/*dbeaver*win*installer*.exe")
@@ -82,8 +118,8 @@ def test_normalize_windows_installer_agent_prompt_adds_reuse_hint() -> None:
     assert "os.environ" in prompt
     assert "다른 공식 페이지나 공식 release 페이지도 확인" in prompt
     assert "absolute https .exe URL 후보" in prompt
-    assert "https://dbeaver.com/download/" in prompt
-    assert "https://github.com/dbeaver/dbeaver/releases/latest" in prompt
+    assert "공식 source는 작업과 일치하는 vendor site" in prompt
+    assert "하드코딩된 버전 번호나 추측한 파일명으로 점프하지 말고" in prompt
     assert "이미 Downloads 폴더에 사용할 수 있는 대상 앱의 Windows installer" in prompt
 
 
@@ -96,6 +132,69 @@ def test_normalize_windows_installer_agent_prompt_uses_target_app_keyword() -> N
     assert "`dbeaver`" in prompt
     assert "`run`" not in prompt
     assert "`locate`" not in prompt
+
+
+def test_target_installer_keywords_filters_generic_english_words() -> None:
+    keywords = _target_installer_keywords(
+        "Using Python, download the official KakaoTalk Windows installer .exe from the official page.",
+        limit=3,
+    )
+    assert "kakaotalk" in keywords
+    assert "python" not in keywords
+    assert "the" not in keywords
+
+
+def test_target_installer_keywords_filter_template_words_from_gui_first_prompt() -> None:
+    keywords = _target_installer_keywords(
+        "카카오톡 pc버전 프로그램을 설치해줘",
+        "Open official download page",
+        "Use Python-driven browser automation on the Windows desktop to open the official KakaoTalk service page and verify the downloaded installer.",
+        limit=4,
+    )
+    assert "kakaotalk" in keywords
+    assert "driven" not in keywords
+    assert "automation" not in keywords
+    assert "verify" not in keywords
+    assert "downloaded" not in keywords
+    assert "service" not in keywords
+
+
+def test_target_installer_keywords_extract_korean_app_name() -> None:
+    keywords = _target_installer_keywords("카카오톡 pc버전 프로그램을 설치해줘", limit=2)
+    assert "카카오톡" in keywords
+    assert "프로그램을" not in keywords
+    assert "설치해줘" not in keywords
+
+
+def test_decode_bing_result_url_decodes_redirect_payload() -> None:
+    redirected = (
+        "https://www.bing.com/ck/a?!&&p=xxx&u="
+        "a1aHR0cHM6Ly93d3cua2FrYW9jb3JwLmNvbS9wYWdlL3NlcnZpY2Uvc2VydmljZS9LYWthb1RhbGs_bGFuZz1rbw"
+        "&ntb=1"
+    )
+    assert _decode_bing_result_url(redirected) == "https://www.kakaocorp.com/page/service/service/KakaoTalk?lang=ko"
+
+
+def test_extract_bing_result_candidates_and_select_official_urls_prefer_corporate_host() -> None:
+    sample_html = """
+    <li class="b_algo">
+      <h2 class=""><a href="https://www.bing.com/ck/a?!&&amp;p=1&amp;u=a1aHR0cHM6Ly9hcHBzLm1pY3Jvc29mdC5jb20vZGV0YWlsL3hwOWsxNzhsNWcwanEwP2hsPWtvLUtSJmdsPUNH&amp;ntb=1">카카오톡 - Windows에서 다운로드 및 설치 | Microsoft Store</a></h2>
+      <p>Microsoft Store에서 카카오톡을 설치합니다.</p>
+    </li>
+    <li class="b_algo">
+      <h2 class=""><a href="https://www.bing.com/ck/a?!&&amp;p=2&amp;u=a1aHR0cHM6Ly93d3cua2FrYW9jb3JwLmNvbS9wYWdlL3NlcnZpY2Uvc2VydmljZS9LYWthb1RhbGs_bGFuZz1rbw&amp;ntb=1">쓰는이에 집중. 쓰기좋게 맞춤. 카카오톡 | 카카오</a></h2>
+      <p>카카오 공식 서비스 페이지입니다.</p>
+    </li>
+    <li class="b_algo">
+      <h2 class=""><a href="https://pc-kakaocorp.com/">카카오톡 공식 웹사이트 - 카카오톡 공식 다운로드</a></h2>
+      <p>공식 다운로드라고 주장하는 서드파티 페이지입니다.</p>
+    </li>
+    """
+    candidates = _extract_bing_result_candidates(sample_html)
+    urls = _select_official_page_urls("카카오톡 pc버전 프로그램을 설치해줘", candidates, limit=2)
+    assert urls
+    assert urls[0] == "https://www.kakaocorp.com/page/service/service/KakaoTalk?lang=ko"
+    assert "pc-kakaocorp.com" not in urls[0]
 
 
 def test_normalize_windows_installer_agent_prompt_adds_install_chunk_guidance() -> None:
@@ -124,6 +223,21 @@ def test_normalize_windows_installer_agent_prompt_does_not_add_run_hint_to_downl
     assert "새로 받지 말고" in prompt
 
 
+def test_normalize_windows_installer_agent_prompt_keeps_download_chunk_as_download_when_text_mentions_finishing() -> None:
+    prompt = _normalize_windows_installer_agent_prompt(
+        source_task="카카오톡 pc버전 프로그램을 설치해줘",
+        title="Download installer",
+        agent_prompt=(
+            "Use Python on Windows to open the official vendor page, find the Windows PC installer link, "
+            "download the official `.exe` into Downloads, and confirm the download completed successfully before finishing."
+        ),
+        execution_style="gui_first",
+    )
+    assert "실행할 installer는" not in prompt
+    assert "현재 스크린샷에 브라우저" in prompt
+    assert "새 다운로드 helper나 URL 탐색 로직" not in prompt
+
+
 def test_normalize_general_gui_agent_prompt_adds_continue_hint() -> None:
     prompt = _normalize_general_gui_agent_prompt(
         title="Create Eclipse project",
@@ -150,6 +264,119 @@ def test_compose_chunk_prompt_requires_python_only() -> None:
     assert prompt.startswith("Return executable Python only for this chunk.")
 
 
+def test_compose_chunk_prompt_gui_first_mentions_visible_ui() -> None:
+    prompt = _compose_chunk_prompt(
+        TeacherTaskChunk(
+            chunk_id="chunk-001",
+            title="Download DBeaver",
+            agent_prompt="DBeaver installer `.exe`를 다운로드하세요.",
+            success_hint=None,
+            preconditions=[],
+            verification=None,
+            max_retries=0,
+            on_fail="fail_session",
+            notes=[],
+        ),
+        execution_style="gui_first",
+    )
+    assert "currently visible browser" in prompt
+    assert "do not switch to fresh direct HTTP fetching" in prompt
+    assert "click_download_like_target()" in prompt
+
+
+def test_normalize_chunks_adds_file_size_check_for_windows_download_chunk() -> None:
+    chunks = _normalize_chunks(
+        {
+            "chunks": [
+                {
+                    "chunk_id": "chunk-001",
+                    "title": "Download installer exe",
+                    "agent_prompt": "Open the official page and download the Windows installer `.exe` into Downloads.",
+                    "verification": {
+                        "checks": [
+                            {"kind": "file_exists_glob", "pattern": "~/Downloads/*kakaotalk*.exe"},
+                        ]
+                    },
+                }
+            ]
+        },
+        source_task="카카오톡 pc버전 프로그램을 설치해줘",
+        source_text="dummy",
+        execution_style="gui_first",
+    )
+    checks = chunks[0].verification["checks"]
+    assert any(check["kind"] == "file_size_gt" for check in checks)
+
+
+def test_normalize_chunks_keeps_download_chunk_verifier_as_download_checks() -> None:
+    chunks = _normalize_chunks(
+        {
+            "chunks": [
+                {
+                    "chunk_id": "chunk-001",
+                    "title": "공식 설치 파일 다운로드",
+                    "agent_prompt": (
+                        "Windows 데스크톱에서 Python을 사용해 공식 설치 페이지를 연 뒤, "
+                        "`https://vendor.example/download`에서 `Windows (Installer)` 링크를 찾아 "
+                        "`.exe` 설치 파일만 다운로드하세요. 파일은 `Downloads` 폴더에 저장하고, "
+                        "다운로드가 끝나면 임시 확장자가 남아 있지 않은지 확인하세요."
+                    ),
+                    "verification": {
+                        "checks": [
+                            {"kind": "file_exists_glob", "pattern": "~/Downloads/dbeaver*.exe"},
+                            {"kind": "file_size_gt", "pattern": "~/Downloads/dbeaver*.exe", "bytes": 1000000},
+                        ]
+                    },
+                }
+            ]
+        },
+        source_task="dbeaver 프로그램을 설치해줘",
+        source_text="dummy",
+        execution_style="gui_first",
+    )
+    checks = chunks[0].verification["checks"]
+    assert any(check["kind"] == "file_exists_glob" for check in checks)
+    assert any(check["kind"] == "file_size_gt" for check in checks)
+    assert not any(check["kind"] == "json_marker_valid_exe" for check in checks)
+    assert not any(check.get("path") == "~/Downloads/install-success.json" for check in checks)
+
+
+def test_merge_gui_first_navigation_chunks_folds_page_open_into_download() -> None:
+    chunks = _merge_gui_first_navigation_chunks(
+        [
+            TeacherTaskChunk(
+                chunk_id="chunk-001",
+                title="Open official page",
+                agent_prompt="Use Python to open a browser and navigate to the official download page, then identify the installer link.",
+                preconditions=["Browser is available."],
+                verification={"checks": [{"kind": "path_exists", "path": "~/Downloads"}]},
+                max_retries=1,
+                on_fail="retry_current_chunk",
+                notes=[],
+            ),
+            TeacherTaskChunk(
+                chunk_id="chunk-002",
+                title="Download installer exe",
+                agent_prompt="Download the official Windows installer `.exe` into Downloads.",
+                preconditions=["Official page is reachable."],
+                verification={
+                    "checks": [
+                        {"kind": "file_exists_glob", "pattern": "~/Downloads/*targetapp*.exe"},
+                        {"kind": "file_size_gt", "pattern": "~/Downloads/*targetapp*.exe", "bytes": 1000000},
+                    ]
+                },
+                max_retries=1,
+                on_fail="retry_current_chunk",
+                notes=[],
+            ),
+        ]
+    )
+    assert len(chunks) == 1
+    assert "Navigation stage to preserve" in chunks[0].agent_prompt
+    assert "Download stage" in chunks[0].agent_prompt
+    assert "merged_prior_navigation_chunk" in chunks[0].notes
+
+
 def test_build_local_teacher_fallback_for_install_task_produces_python_first_chunks() -> None:
     teacher_result, teacher_plan = build_local_teacher_fallback(
         task="dbeaver를 설치해줘",
@@ -157,19 +384,185 @@ def test_build_local_teacher_fallback_for_install_task_produces_python_first_chu
         command_template="codex exec '{prompt}'",
         cwd="..",
         error="teacher quota exhausted",
+        execution_style="python_first",
     )
     assert "external teacher was unavailable" in teacher_result.response_text
     assert len(teacher_plan.chunks) == 3
     assert "Python" in teacher_plan.chunks[0].agent_prompt
     assert "If one official page does not expose a raw `.exe` link" in teacher_plan.chunks[0].agent_prompt
     assert any(check["kind"] == "file_exists_glob" for check in teacher_plan.chunks[0].verification["checks"])
-    assert any(check["kind"] == "file_exists_glob" for check in teacher_plan.chunks[1].verification["checks"])
+    assert any(check["kind"] == "path_exists" for check in teacher_plan.chunks[1].verification["checks"])
+    assert any(check["kind"] == "json_marker_valid_exe" for check in teacher_plan.chunks[1].verification["checks"])
     assert "First inspect the current screenshot and desktop state" in teacher_plan.chunks[1].agent_prompt
     assert "Do not download anything in this chunk." in teacher_plan.chunks[1].agent_prompt
     assert "Launching only the final app executable is not enough for this chunk." in teacher_plan.chunks[1].agent_prompt
     assert "Avoid recursively scanning the whole of `%LOCALAPPDATA%` or `%ProgramFiles%`." in teacher_plan.chunks[1].agent_prompt
-    assert "%LOCALAPPDATA%\\\\Programs\\\\DBeaver" in teacher_plan.chunks[1].agent_prompt
+    assert "%LOCALAPPDATA%\\\\Programs\\\\dbeaver" in teacher_plan.chunks[1].agent_prompt
     assert "Do not import `pywin32`, `pywinauto`, `win32gui`, `win32con`, `win32api`, or `pythoncom`." in teacher_plan.chunks[1].agent_prompt
-    assert any(check["kind"] == "process_exists" for check in teacher_plan.chunks[2].verification["checks"])
+    assert any(check["kind"] == "path_exists" for check in teacher_plan.chunks[2].verification["checks"])
     assert teacher_plan.chunks[1].max_retries == 2
     assert teacher_plan.chunks[2].max_retries == 2
+
+
+def test_build_local_teacher_fallback_for_install_task_can_produce_gui_first_chunks() -> None:
+    teacher_result, teacher_plan = build_local_teacher_fallback(
+        task="dbeaver를 설치해줘",
+        prompt="dummy prompt",
+        command_template="codex exec '{prompt}'",
+        cwd="..",
+        error="teacher quota exhausted",
+        execution_style="gui_first",
+    )
+    assert "GUI-first Windows automation" in teacher_result.response_text
+    assert "현재 스크린샷에 브라우저" in teacher_plan.chunks[0].agent_prompt
+    assert "drive that visible UI forward if present" in teacher_plan.chunks[1].agent_prompt
+    assert "gui_first_download_chunk" in teacher_plan.chunks[0].notes
+
+
+def test_build_local_teacher_fallback_for_korean_task_uses_real_app_token() -> None:
+    _, teacher_plan = build_local_teacher_fallback(
+        task="카카오톡 pc버전 프로그램을 설치해줘",
+        prompt="dummy prompt",
+        command_template="codex exec '{prompt}'",
+        cwd="..",
+        error="teacher quota exhausted",
+        execution_style="gui_first",
+    )
+    download_chunk = teacher_plan.chunks[0]
+    assert "Targetapp" not in download_chunk.agent_prompt
+    assert "카카오톡" in download_chunk.agent_prompt
+    assert "computer-use-agent-context.json" in download_chunk.agent_prompt
+    checks = download_chunk.verification["checks"]
+    assert any(check["pattern"] == "~/Downloads/*kakaotalk*.exe" for check in checks if check["kind"] == "file_exists_glob")
+    install_checks = teacher_plan.chunks[1].verification["checks"]
+    marker_check = next(check for check in install_checks if check["kind"] == "json_marker_valid_exe")
+    assert "카카오톡" in marker_check["keywords"]
+
+
+def test_task_staging_subdir_changes_with_session_salt() -> None:
+    task = "카카오톡 pc버전 프로그램을 설치해줘"
+    first = _task_staging_subdir(task, salt="session-a")
+    second = _task_staging_subdir(task, salt="session-b")
+    assert first != second
+    assert first
+    assert second
+
+
+def test_build_local_teacher_fallback_uses_supplied_staging_subdir() -> None:
+    _, teacher_plan = build_local_teacher_fallback(
+        task="카카오톡 pc버전 프로그램을 설치해줘",
+        prompt="dummy prompt",
+        command_template="codex exec '{prompt}'",
+        cwd="..",
+        error="teacher quota exhausted",
+        execution_style="gui_first",
+        staging_subdir="custom-stage-1234",
+    )
+    download_chunk = teacher_plan.chunks[0]
+    assert "computer-use-agent-context.json" in download_chunk.agent_prompt
+    assert "custom-stage-1234" not in download_chunk.agent_prompt
+    assert any(
+        check.get("pattern") == "~/Downloads/*kakaotalk*.exe"
+        for check in download_chunk.verification["checks"]
+        if check["kind"] == "file_exists_glob"
+    )
+
+
+def test_build_local_teacher_fallback_injects_discovered_official_page_urls() -> None:
+    with patch(
+        "computer_use_training_generator.teacher._discover_official_page_urls",
+        return_value=[
+            "https://www.kakaocorp.com/page/service/service/KakaoTalk?lang=ko",
+            "https://apps.microsoft.com/detail/xp9k178l5g0jq0?hl=ko-KR&gl=CG",
+        ],
+    ):
+        _, teacher_plan = build_local_teacher_fallback(
+            task="카카오톡 pc버전 프로그램을 설치해줘",
+            prompt="dummy prompt",
+            command_template="codex exec '{prompt}'",
+            cwd="..",
+            error="teacher quota exhausted",
+            execution_style="gui_first",
+        )
+    download_chunk = teacher_plan.chunks[0]
+    assert "Use these exact official page URLs first before any search engine result or inferred domain:" in download_chunk.agent_prompt
+    assert "https://www.kakaocorp.com/page/service/service/KakaoTalk?lang=ko" in download_chunk.agent_prompt
+    install_marker_check = next(
+        check for check in teacher_plan.chunks[1].verification["checks"] if check["kind"] == "json_marker_valid_exe"
+    )
+    assert "kakaotalk" in install_marker_check["keywords"]
+
+
+def test_normalize_chunks_replaces_store_detour_plan_for_windows_installer_task() -> None:
+    chunks = _normalize_chunks(
+        {
+            "chunks": [
+                {
+                    "chunk_id": "chunk-001",
+                    "title": "Open store listing",
+                    "agent_prompt": (
+                        "Open the Microsoft Store listing at "
+                        "https://apps.microsoft.com/detail/example and prepare installation."
+                    ),
+                    "verification": None,
+                }
+            ]
+        },
+        source_task="어떤 프로그램을 설치해줘",
+        source_text="teacher text",
+        execution_style="gui_first",
+    )
+    assert len(chunks) == 3
+    assert any("다운로드" in chunk.agent_prompt or "download" in chunk.agent_prompt.lower() for chunk in chunks)
+    assert not any("apps.microsoft.com" in chunk.agent_prompt.lower() for chunk in chunks)
+
+
+def test_normalize_chunks_keeps_store_plan_when_task_explicitly_requests_store() -> None:
+    chunks = _normalize_chunks(
+        {
+            "chunks": [
+                {
+                    "chunk_id": "chunk-001",
+                    "title": "Open store listing",
+                    "agent_prompt": "Open the Microsoft Store listing at https://apps.microsoft.com/detail/example.",
+                    "verification": None,
+                }
+            ]
+        },
+        source_task="microsoft store에서 어떤 프로그램을 설치해줘",
+        source_text="teacher text",
+        execution_style="gui_first",
+    )
+    assert len(chunks) == 1
+    assert "apps.microsoft.com" in chunks[0].agent_prompt.lower()
+
+
+def test_normalize_chunks_prioritizes_install_marker_verifier_for_installer_run_prompt() -> None:
+    chunks = _normalize_chunks(
+        {
+            "chunks": [
+                {
+                    "chunk_id": "chunk-001",
+                    "title": "Run KakaoTalk installer",
+                    "agent_prompt": (
+                        "Use Python to launch the KakaoTalk installer `.exe` that was downloaded in `~/Downloads`, "
+                        "then drive the Windows installer wizard to completion with default options. "
+                        "If a Windows UAC or permission prompt appears, approve it so the installation can proceed."
+                    ),
+                    "verification": {
+                        "checks": [
+                            {"kind": "path_exists", "path": "C:/Program Files/KakaoTalk"},
+                            {"kind": "process_exists", "name": "KakaoTalk.exe"},
+                        ]
+                    },
+                }
+            ]
+        },
+        source_task="카카오톡 pc버전 프로그램을 설치해줘",
+        source_text="teacher text",
+        execution_style="gui_first",
+    )
+    checks = chunks[0].verification["checks"]
+    assert checks[0]["path"] == "~/Downloads/install-success.json"
+    assert checks[1]["kind"] == "json_marker_valid_exe"
+    assert checks[1]["field"] == "installed_exe"

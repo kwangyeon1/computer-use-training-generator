@@ -4,6 +4,7 @@
   "teacher_split_enabled": true,
   "teacher_split_timeout_s": 600,
   "teacher_workdir": "..",
+  "execution_style": "python_first",
   "teacher_task_context": "You are planning actions for a remote Windows desktop controlled by a computer-use agent through an executor endpoint. Do not answer based on your own local Codex CLI sandbox limitations. Assume the agent can control GUI apps, browsers, files, downloads, installers, and subprocesses on the target Windows machine. Provide actionable guidance for that target Windows machine only. For software installation tasks, prefer official vendor sources and prefer the official Windows installer .exe, not zip or portable archive builds, unless the task explicitly requests another format. Produce steps that can verify download completion and installation success on Windows.",
   "chunk_verification_enabled": true,
   "chunk_verification_timeout_s": 60,
