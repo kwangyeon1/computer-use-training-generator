@@ -32,7 +32,7 @@ Requirements:
             {{"kind": "path_exists", "path": "~/Downloads/example.exe"}},
             {{"kind": "file_exists_glob", "pattern": "~/Downloads/example-*.exe"}},
             {{"kind": "file_size_gt", "pattern": "~/Downloads/example-*.exe", "bytes": 1000000}},
-            {{"kind": "process_exists", "name": "KakaoTalk.exe"}}
+            {{"kind": "process_exists", "name": "ExampleApp.exe"}}
           ]
         }},
         "max_retries": 1,
@@ -820,6 +820,37 @@ def _looks_like_install_execution_chunk(title: str, agent_prompt: str) -> bool:
     combined = f"{title}\n{agent_prompt}".lower()
     if any(token in combined for token in ("login screen", "로그인 화면", "launch marker", "start menu", "foreground")):
         return False
+    download_stage_markers = (
+        "download the official windows installer",
+        "download the windows installer",
+        "download the installer",
+        "download the official",
+        "save it to",
+        "save it into",
+        "downloads folder",
+        "download completed",
+        "다운로드하세요",
+        "다운로드가 끝나면",
+        "다운로드 버튼",
+        "다운로드 진행 ui",
+    )
+    strong_install_markers = (
+        "run the installer",
+        "launch the installer",
+        "execute the installer",
+        "installer wizard",
+        "uac prompt",
+        "license dialog",
+        "destination dialog",
+        "completion dialog",
+        "do not download anything in this chunk",
+        "설치 파일 실행",
+        "설치 마법사",
+        "설치 관리자",
+        "설치 진행",
+        "설치 완료",
+        "권한 창",
+    )
     install_run_markers = (
         "launch the downloaded",
         "launch the installer",
@@ -828,6 +859,10 @@ def _looks_like_install_execution_chunk(title: str, agent_prompt: str) -> bool:
         "execute the installer",
         "installer wizard",
         "uac prompt",
+        "license dialog",
+        "destination dialog",
+        "completion dialog",
+        "do not download anything in this chunk",
         "uac or permission prompt",
         "permission prompt",
         "approve it",
@@ -845,39 +880,9 @@ def _looks_like_install_execution_chunk(title: str, agent_prompt: str) -> bool:
         "권한 창",
         "실행",
     )
-    if (
-        any(token in combined for token in ("download the", "download installer", "download the windows installer", "다운로드"))
-        and not any(marker in combined for marker in install_run_markers)
-    ):
+    if any(marker in combined for marker in download_stage_markers) and not any(marker in combined for marker in strong_install_markers):
         return False
-    return ".exe" in combined and any(
-        token in combined
-        for token in (
-            "launch the downloaded",
-            "launch the installer",
-            "run installer",
-            "run the installer",
-            "execute the installer",
-            "installer wizard",
-            "uac prompt",
-            "uac or permission prompt",
-            "permission prompt",
-            "approve it",
-            "complete the installation",
-            "complete the setup",
-            "finish install",
-            "finish setup",
-            "drive the windows installer",
-            "drive the installer",
-            "설치 파일 실행",
-            "설치 마법사",
-            "설치 관리자",
-            "설치 진행",
-            "설치 완료",
-            "권한 창",
-            "설치",
-        )
-    )
+    return ".exe" in combined and any(marker in combined for marker in install_run_markers)
 
 
 def _looks_like_launch_execution_chunk(title: str, agent_prompt: str) -> bool:
@@ -991,52 +996,9 @@ def _normalize_windows_installer_agent_prompt(
         "작업 도중 새 다운로드 helper나 URL 탐색 로직을 추가하지 마세요."
     )
     source_hint = _official_source_hint(source_task, title, raw)
-    download_stage_markers = (
-        "download the installer",
-        "download the official",
-        "download the windows",
-        "download the",
-        "save the installer",
-        "save it to",
-        "save it into",
-        "save the downloaded",
-        "find the installer link",
-        "find the windows pc installer link",
-        "find the windows installer link",
-        "official page",
-        "official download page",
-        "official release page",
-        "release page",
-        "landing page",
-        "다운로드",
-        "공식 페이지",
-    )
-    install_action_markers = (
-        "run the installer",
-        "launch the installer",
-        "run it",
-        "launch it",
-        "locate the downloaded",
-        "locate the newest",
-        "complete the installation",
-        "finish the installation",
-        "installer wizard",
-        "uac prompt",
-        "license dialog",
-        "destination dialog",
-        "completion dialog",
-        "do not download anything in this chunk",
-        "이미 다운로드된",
-        "설치 마법사",
-        "설치 ui",
-        "실행",
-        "설치 완료",
-        "설치가 완료",
-        "마법사",
-    )
-    download_hits = sum(1 for keyword in download_stage_markers if keyword in combined)
-    install_hits = sum(1 for keyword in install_action_markers if keyword in combined)
-    if "windows" in combined and ".exe" in combined and install_hits > download_hits and install_hits > 0:
+    raw_install_chunk = _looks_like_install_execution_chunk(title, raw)
+    raw_download_chunk = _looks_like_download_chunk(title, raw)
+    if raw_install_chunk:
         install_hint = (
             "실행할 installer는 현재 작업 대상 앱과 일치하는 `.exe`만 고르세요.\n"
             + _matching_installer_hint(source_task=source_task, title=title, agent_prompt=raw, action="실행")
@@ -1047,7 +1009,7 @@ def _normalize_windows_installer_agent_prompt(
         if install_hint not in normalized:
             normalized = f"{install_hint}\n\n{normalized}"
         return normalized
-    if "windows" in combined and ".exe" in combined and download_hits > 0:
+    if raw_download_chunk:
         reuse_hint = (
             "이미 Downloads 폴더에 사용할 수 있는 대상 앱의 Windows installer `.exe`가 있으면 새로 받지 말고 그 파일을 그대로 사용해도 됩니다.\n"
             + _matching_installer_hint(source_task=source_task, title=title, agent_prompt=raw, action="사용")

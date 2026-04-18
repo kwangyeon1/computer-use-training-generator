@@ -8,6 +8,7 @@ from computer_use_training_generator.verification import (
 from computer_use_training_generator.teacher import (
     _decode_bing_result_url,
     _extract_bing_result_candidates,
+    _looks_like_install_execution_chunk,
     _merge_gui_first_navigation_chunks,
     _normalize_chunks,
     build_local_teacher_fallback,
@@ -88,7 +89,15 @@ def test_build_verification_code_supports_json_marker_valid_exe() -> None:
     )
     assert code is not None
     assert "_validate_json_marker_exe" in code
-    assert 'kind == "json_marker_valid_exe"' in code
+
+
+def test_install_execution_chunk_does_not_match_download_stage_prompt() -> None:
+    prompt = (
+        "Use executable Python on the Windows machine to download the official Windows installer `.exe` "
+        "and save it to Downloads. If the download finishes, log the filename and confirm temporary "
+        "download extensions disappeared."
+    )
+    assert _looks_like_install_execution_chunk("Download targetapp installer", prompt) is False
 
 
 def test_simplify_windows_installer_glob_prefers_vendor_exe_glob() -> None:
@@ -297,6 +306,39 @@ def test_normalize_chunks_adds_file_size_check_for_windows_download_chunk() -> N
     )
     checks = chunks[0].verification["checks"]
     assert any(check["kind"] == "file_size_gt" for check in checks)
+
+
+def test_normalize_chunks_keeps_download_chunk_verifier_as_download_checks() -> None:
+    chunks = _normalize_chunks(
+        {
+            "chunks": [
+                {
+                    "chunk_id": "chunk-001",
+                    "title": "공식 설치 파일 다운로드",
+                    "agent_prompt": (
+                        "Windows 데스크톱에서 Python을 사용해 공식 설치 페이지를 연 뒤, "
+                        "`https://vendor.example/download`에서 `Windows (Installer)` 링크를 찾아 "
+                        "`.exe` 설치 파일만 다운로드하세요. 파일은 `Downloads` 폴더에 저장하고, "
+                        "다운로드가 끝나면 임시 확장자가 남아 있지 않은지 확인하세요."
+                    ),
+                    "verification": {
+                        "checks": [
+                            {"kind": "file_exists_glob", "pattern": "~/Downloads/dbeaver*.exe"},
+                            {"kind": "file_size_gt", "pattern": "~/Downloads/dbeaver*.exe", "bytes": 1000000},
+                        ]
+                    },
+                }
+            ]
+        },
+        source_task="dbeaver 프로그램을 설치해줘",
+        source_text="dummy",
+        execution_style="gui_first",
+    )
+    checks = chunks[0].verification["checks"]
+    assert any(check["kind"] == "file_exists_glob" for check in checks)
+    assert any(check["kind"] == "file_size_gt" for check in checks)
+    assert not any(check["kind"] == "json_marker_valid_exe" for check in checks)
+    assert not any(check.get("path") == "~/Downloads/install-success.json" for check in checks)
 
 
 def test_merge_gui_first_navigation_chunks_folds_page_open_into_download() -> None:
