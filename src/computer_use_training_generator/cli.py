@@ -168,7 +168,7 @@ def _extract_verified_installer_paths(verification_result: dict | None) -> list[
         pattern_value = str(entry.get("pattern") or "").strip()
         if path_value:
             candidates.append(path_value)
-        if pattern_value.endswith(".exe") and "*" not in pattern_value:
+        if pattern_value.lower().endswith((".exe", ".msi")) and "*" not in pattern_value:
             candidates.append(pattern_value)
         matches = entry.get("matches") or []
         if isinstance(matches, list):
@@ -181,7 +181,7 @@ def _extract_verified_installer_paths(verification_result: dict | None) -> list[
                     candidates.append(candidate)
         for candidate in candidates:
             normalized = candidate.replace("\\", "/").rstrip()
-            if not normalized.lower().endswith(".exe"):
+            if not normalized.lower().endswith((".exe", ".msi")):
                 continue
             lowered = normalized.lower()
             if lowered in seen:

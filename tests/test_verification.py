@@ -42,6 +42,7 @@ def test_expanded_glob_patterns_relaxes_brittle_windows_installer_glob() -> None
     assert "~/Downloads/*dbeaver*win*installer*.exe" in patterns
     assert "~/Downloads/*dbeaver*win*setup*.exe" in patterns
     assert "~/Downloads/*dbeaver*.exe" in patterns
+    assert "~/Downloads/*dbeaver*.msi" in patterns
 
 
 def test_has_file_based_checks_detects_download_verifiers() -> None:
@@ -107,6 +108,13 @@ def test_simplify_windows_installer_glob_prefers_vendor_exe_glob() -> None:
     )
 
 
+def test_simplify_windows_installer_glob_preserves_msi_extension() -> None:
+    assert (
+        _simplify_windows_installer_glob("~/Downloads/*sqlite*windows*installer*.msi")
+        == "~/Downloads/*sqlite*.msi"
+    )
+
+
 def test_normalize_windows_installer_agent_prompt_adds_reuse_hint() -> None:
     prompt = _normalize_windows_installer_agent_prompt(
         source_task="dbeaver를 설치해줘",
@@ -118,6 +126,7 @@ def test_normalize_windows_installer_agent_prompt_adds_reuse_hint() -> None:
     assert "os.environ" in prompt
     assert "다른 공식 페이지나 공식 release 페이지도 확인" in prompt
     assert "absolute https .exe URL 후보" in prompt
+    assert ".msi URL 후보" in prompt
     assert "공식 source는 작업과 일치하는 vendor site" in prompt
     assert "하드코딩된 버전 번호나 추측한 파일명으로 점프하지 말고" in prompt
     assert "이미 Downloads 폴더에 사용할 수 있는 대상 앱의 Windows installer" in prompt
@@ -142,6 +151,26 @@ def test_target_installer_keywords_filters_generic_english_words() -> None:
     assert "kakaotalk" in keywords
     assert "python" not in keywords
     assert "the" not in keywords
+
+
+def test_target_installer_keywords_filters_for_from_db_browser_task() -> None:
+    keywords = _target_installer_keywords("DB Browser for SQLite 프로그램을 설치해줘", limit=3)
+    assert "sqlite" in keywords
+    assert "for" not in keywords
+
+
+def test_local_install_marker_keywords_ignore_discovered_url_noise() -> None:
+    _, teacher_plan = build_local_teacher_fallback(
+        task="DB Browser for SQLite 프로그램을 설치해줘",
+        prompt="dummy prompt",
+        command_template="",
+        cwd=None,
+        error="teacher unavailable",
+        execution_style="gui_first",
+    )
+    install_checks = teacher_plan.chunks[1].verification["checks"]
+    marker_check = next(check for check in install_checks if check["kind"] == "json_marker_valid_exe")
+    assert marker_check["keywords"] == ["sqlite"]
 
 
 def test_target_installer_keywords_filter_template_words_from_gui_first_prompt() -> None:
@@ -308,6 +337,30 @@ def test_normalize_chunks_adds_file_size_check_for_windows_download_chunk() -> N
     assert any(check["kind"] == "file_size_gt" for check in checks)
 
 
+def test_normalize_chunks_adds_file_size_check_for_windows_msi_download_chunk() -> None:
+    chunks = _normalize_chunks(
+        {
+            "chunks": [
+                {
+                    "chunk_id": "chunk-001",
+                    "title": "Download installer msi",
+                    "agent_prompt": "Open the official page and download the Windows installer `.msi` into Downloads.",
+                    "verification": {
+                        "checks": [
+                            {"kind": "file_exists_glob", "pattern": "~/Downloads/*sqlite*.msi"},
+                        ]
+                    },
+                }
+            ]
+        },
+        source_task="DB Browser for SQLite 프로그램을 설치해줘",
+        source_text="dummy",
+        execution_style="gui_first",
+    )
+    checks = chunks[0].verification["checks"]
+    assert any(check["kind"] == "file_size_gt" and check["pattern"] == "~/Downloads/*sqlite*.msi" for check in checks)
+
+
 def test_normalize_chunks_keeps_download_chunk_verifier_as_download_checks() -> None:
     chunks = _normalize_chunks(
         {
@@ -339,6 +392,90 @@ def test_normalize_chunks_keeps_download_chunk_verifier_as_download_checks() -> 
     assert any(check["kind"] == "file_size_gt" for check in checks)
     assert not any(check["kind"] == "json_marker_valid_exe" for check in checks)
     assert not any(check.get("path") == "~/Downloads/install-success.json" for check in checks)
+
+
+def test_normalize_chunks_removes_optional_checksum_chunk_for_install_task() -> None:
+    chunks = _normalize_chunks(
+        {
+            "chunks": [
+                {
+                    "chunk_id": "chunk-001",
+                    "title": "Download installer",
+                    "agent_prompt": "Download the official Windows installer `.msi` into Downloads.",
+                    "verification": {"checks": [{"kind": "file_exists_glob", "pattern": "~/Downloads/*sqlite*.msi"}]},
+                },
+                {
+                    "chunk_id": "chunk-002",
+                    "title": "Verify installer checksum",
+                    "agent_prompt": "Download SHA256SUMS.txt and verify the MSI checksum.",
+                    "verification": {"checks": [{"kind": "file_exists_glob", "pattern": "~/Downloads/SHA256SUMS.txt"}]},
+                },
+                {
+                    "chunk_id": "chunk-003",
+                    "title": "Install app",
+                    "agent_prompt": "Run the downloaded Windows installer `.msi` with msiexec and finish installation.",
+                    "preconditions": ["The MSI has been downloaded and checksum-verified"],
+                    "verification": {"checks": [{"kind": "path_exists", "path": "C:\\Program Files\\TargetApp"}]},
+                },
+            ]
+        },
+        source_task="DB Browser for SQLite 프로그램을 설치해줘",
+        source_text="dummy",
+        execution_style="gui_first",
+    )
+    assert [chunk.chunk_id for chunk in chunks] == ["chunk-001", "chunk-003"]
+    assert all("checksum" not in " ".join(chunk.preconditions).lower() for chunk in chunks)
+    assert "optional_checksum_chunk_removed" in chunks[-1].notes
+
+
+def test_normalize_chunks_replaces_msi_install_path_alternatives_with_marker_verification() -> None:
+    chunks = _normalize_chunks(
+        {
+            "chunks": [
+                {
+                    "chunk_id": "chunk-002",
+                    "title": "Run Installer",
+                    "agent_prompt": (
+                        "Launch the downloaded target app MSI from Downloads using Python automation on the Windows machine. "
+                        "Complete the setup flow by following the standard installer dialogs."
+                    ),
+                    "verification": {
+                        "checks": [
+                            {"kind": "path_exists", "path": "~/AppData/Local/Programs/Target App"},
+                            {"kind": "path_exists", "path": "C:/Program Files/Target App"},
+                            {"kind": "path_exists", "path": "C:/Program Files (x86)/Target App"},
+                        ]
+                    },
+                }
+            ]
+        },
+        source_task="Target App 프로그램을 설치해줘",
+        source_text="dummy",
+        execution_style="gui_first",
+    )
+    checks = chunks[0].verification["checks"]
+    assert any(check["kind"] == "path_exists" and check["path"] == "~/Downloads/install-success.json" for check in checks)
+    assert any(check["kind"] == "json_marker_valid_exe" for check in checks)
+    assert not any(str(check.get("path", "")).startswith("C:/Program Files") for check in checks)
+
+
+def test_normalize_chunks_keeps_checksum_chunk_when_task_requests_checksum() -> None:
+    chunks = _normalize_chunks(
+        {
+            "chunks": [
+                {
+                    "chunk_id": "chunk-001",
+                    "title": "Verify installer checksum",
+                    "agent_prompt": "Download SHA256SUMS.txt and verify the MSI checksum.",
+                    "verification": {"checks": [{"kind": "file_exists_glob", "pattern": "~/Downloads/SHA256SUMS.txt"}]},
+                },
+            ]
+        },
+        source_task="DB Browser for SQLite 프로그램을 설치하고 checksum도 검증해줘",
+        source_text="dummy",
+        execution_style="gui_first",
+    )
+    assert [chunk.chunk_id for chunk in chunks] == ["chunk-001"]
 
 
 def test_merge_gui_first_navigation_chunks_folds_page_open_into_download() -> None:

@@ -149,6 +149,12 @@ def _expanded_glob_patterns(pattern: str) -> list[str]:
                 relaxed = candidate
         if "installer" in lowered or "setup" in lowered or "windows" in lowered or "win" in lowered:
             _append(_collapse_stars(relaxed))
+    for candidate in list(patterns):
+        candidate_lower = candidate.lower()
+        if candidate_lower.endswith(".exe"):
+            _append(candidate[:-4] + ".msi")
+        elif candidate_lower.endswith(".msi"):
+            _append(candidate[:-4] + ".exe")
 
     return patterns
 
@@ -252,6 +258,12 @@ def _expanded_glob_patterns(pattern):
                 relaxed = candidate
         if "installer" in lowered or "setup" in lowered or "windows" in lowered or "win" in lowered:
             _append(re.sub(r"\\*+", "*", relaxed))
+    for candidate in list(patterns):
+        candidate_lower = candidate.lower()
+        if candidate_lower.endswith(".exe"):
+            _append(candidate[:-4] + ".msi")
+        elif candidate_lower.endswith(".msi"):
+            _append(candidate[:-4] + ".exe")
     return patterns
 
 
