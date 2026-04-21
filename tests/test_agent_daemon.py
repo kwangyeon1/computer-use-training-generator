@@ -39,3 +39,17 @@ def test_named_agent_daemon_request_waits_for_complete_json_response(tmp_path, m
     assert response == {"ok": True, "summary": {"run_dir": "run"}}
     assert not list(requests_dir.glob("*.json"))
     assert not list(responses_dir.glob("*.json"))
+
+
+def test_format_agent_error_response_includes_type_and_traceback() -> None:
+    message = agent_mod._format_agent_error_response(
+        {
+            "ok": False,
+            "error": "",
+            "error_type": "ValueError",
+            "traceback": "Traceback\\nline1\\nline2",
+        }
+    )
+    assert message.startswith("ValueError")
+    assert "traceback:" in message
+    assert "line2" in message

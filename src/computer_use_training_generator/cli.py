@@ -132,10 +132,10 @@ def _compose_chunk_prompt(chunk: TeacherTaskChunk, *, execution_style: str = "py
             "Do not ask a human to perform manual GUI actions outside the generated Python. "
             "If grounded visible browser/download/installer UI is already available, do not switch to fresh direct HTTP fetching, "
             "HTML scraping, or silent-install shortcuts in the same step unless the latest execution proves that UI path stalled. "
-            "If a visible download-like or installer-like control is on screen, prefer OCR-grounded helpers such as "
-            "`click_download_like_target()` or `click_text_targets([...])` before new network-fetch logic. "
-            "If the page looks like a collapsed or responsive header menu layout and the download control is not visible yet, "
-            "prefer `open_responsive_header_menu()` before fresh network discovery."
+            "If a visible download-like or installer-like control is on screen, use the screenshot to choose grounded "
+            "page-content coordinates or keyboard actions instead of guessing a fresh installer URL. "
+            "When retrying on the same page, keep that same tab/page first, avoid previously failed points, try a few distinct "
+            "visible page-content candidates, and do not click the browser toolbar, address bar, tab strip, bookmarks bar, or blank margins."
         )
     else:
         prefix = (
@@ -217,9 +217,23 @@ def _compose_retry_prompt(
     evidence_text = json.dumps(evidence, ensure_ascii=False, indent=2) if evidence else "[]"
     retry_header = f"Previous attempt {attempt_index} did not satisfy the chunk verifier. Retry only this chunk."
     details = [retry_header]
+    normalized_style = _normalize_execution_style(execution_style)
     if error:
         details.append(f"Verifier error: {error}")
     details.append(f"Verifier evidence:\n{evidence_text}")
+    if normalized_style == "gui_first":
+        details.append(
+            "GUI-first retry rule: if the browser page for this chunk is already visible, stay on that same page/tab first. "
+            "Do not guess a new direct installer URL before exhausting the visible page-content path."
+        )
+        details.append(
+            "For a download chunk, end only when the installer file exists on disk with a plausible size. "
+            "Do not launch or silently install the installer in this chunk."
+        )
+        details.append(
+            "If one visible coordinate candidate does not progress, try a different visible page-content candidate in the same script. "
+            "Do not use browser toolbar/address/tab/bookmark areas as click targets."
+        )
     prompt_text = _compose_chunk_prompt(chunk, execution_style=execution_style)
     prompt_text = _append_verified_installer_hint(prompt_text, prior_verification_result)
     return prompt_text + "\n\n" + "\n\n".join(details)

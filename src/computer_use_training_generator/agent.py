@@ -36,6 +36,23 @@ def _format_command_failure(stage: str, result) -> str:
     return "\n".join(details)
 
 
+def _format_agent_error_response(response: dict, *, fallback: str = "agent run failed") -> str:
+    error = str(response.get("error") or "").strip()
+    error_type = str(response.get("error_type") or "").strip()
+    traceback_text = str(response.get("traceback") or "").strip()
+    if error_type and error:
+        message = f"{error_type}: {error}"
+    elif error_type:
+        message = error_type
+    elif error:
+        message = error
+    else:
+        message = fallback
+    if traceback_text:
+        return f"{message}\ntraceback:\n{traceback_text[-4000:]}"
+    return message
+
+
 def _base_agent_command(
     *,
     agent_command: str,
@@ -188,7 +205,7 @@ def run_agent_prompt(
         )
         duration_s = round(time.monotonic() - started, 3)
         if not response.get("ok", False):
-            raise RuntimeError(response.get("error", "agent run failed"))
+            raise RuntimeError(_format_agent_error_response(response, fallback="agent run failed"))
         summary = response.get("summary") or {}
         run_dir = summary.get("run_dir")
         if not run_dir:

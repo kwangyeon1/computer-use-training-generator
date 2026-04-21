@@ -278,6 +278,24 @@ _NON_VENDOR_RESULT_HOST_TOKENS = {
     "tistory",
     "medium",
     "zhihu",
+    "naver",
+    "daum",
+    "google",
+    "bing",
+    "yahoo",
+    "duckduckgo",
+    "baidu",
+}
+
+_REFERENCE_RESULT_TOKENS = {
+    "dictionary",
+    "translate",
+    "translation",
+    "translator",
+    "wiktionary",
+    "thesaurus",
+    "papago",
+    "deepl",
 }
 
 _KOREAN_PARTICLE_SUFFIXES = (
@@ -401,10 +419,11 @@ def _score_official_page_candidate(task: str, candidate: dict[str, str]) -> int:
     parsed = urllib.parse.urlparse(url)
     host = str(parsed.netloc or "").lower()
     path = str(parsed.path or "").lower()
+    decoded_path = urllib.parse.unquote(path)
     registrable = _registrable_host(host)
     labels = [label for label in host.split(".") if label]
     lead_label = labels[0] if labels else ""
-    combined = "\n".join((title, snippet, url)).lower()
+    combined = "\n".join((title, snippet, url, decoded_path)).lower()
     keywords = _target_installer_keywords(task, title, snippet, limit=3)
 
     score = 0
@@ -414,12 +433,34 @@ def _score_official_page_candidate(task: str, candidate: dict[str, str]) -> int:
         score += 12
     if any(token in host for token in _NON_VENDOR_RESULT_HOST_TOKENS):
         score -= 120
+    if any(token in combined for token in _REFERENCE_RESULT_TOKENS):
+        score -= 140
     if "apps.microsoft.com" in host or "microsoft store" in combined:
         score -= 18
     if "notice" in path or "notices" in path:
         score -= 10
     if "/download" in path or "/service/" in path or "/release" in path:
         score += 8
+    if any(
+        marker in combined
+        for marker in (
+            "사용법",
+            "how to",
+            "tutorial",
+            "guide",
+            "review",
+            "후기",
+            "tips",
+            "tip ",
+            "blog",
+        )
+    ):
+        score -= 72
+    if (
+        not any(marker in decoded_path for marker in ("/download", "/downloads", "/service", "/release", "/releases", "/product"))
+        and len([segment for segment in re.split(r"[^a-z0-9가-힣]+", decoded_path) if segment]) >= 3
+    ):
+        score -= 36
     if lead_label and any(lead_label.startswith(prefix) for prefix in ("pc-", "win-", "apps-", "app-")):
         score -= 36
     for token in _SUSPICIOUS_RESULT_HOST_TOKENS:
@@ -439,6 +480,64 @@ def _score_official_page_candidate(task: str, candidate: dict[str, str]) -> int:
         if lowered_keyword in host:
             score += 6
     return score
+
+
+def _looks_like_plausible_official_page_url(url: str) -> bool:
+    parsed = urllib.parse.urlparse(str(url or "").strip())
+    host = str(parsed.netloc or "").lower()
+    if not host:
+        return False
+    if any(token in host for token in _NON_VENDOR_RESULT_HOST_TOKENS):
+        return False
+    if host == "apps.microsoft.com":
+        return False
+    decoded_path = urllib.parse.unquote(str(parsed.path or "")).lower()
+    combined = "\n".join((host, decoded_path))
+    if any(token in combined for token in _REFERENCE_RESULT_TOKENS):
+        return False
+    if any(
+        marker in combined
+        for marker in (
+            "사용법",
+            "tutorial",
+            "guide",
+            "review",
+            "후기",
+            "blog",
+        )
+    ):
+        return False
+    path_tokens = [segment for segment in re.split(r"[^a-z0-9가-힣]+", decoded_path) if segment]
+    has_official_path_marker = any(
+        marker in decoded_path
+        for marker in ("/download", "/downloads", "/service", "/release", "/releases", "/product")
+    )
+    if not has_official_path_marker and len(path_tokens) >= 3:
+        return False
+    return True
+
+
+def _sanitize_discovered_official_urls(task: str, urls: list[str], *, limit: int = 2) -> list[str]:
+    ranked: list[tuple[int, str]] = []
+    seen: set[str] = set()
+    for raw_url in urls:
+        url = str(raw_url or "").strip()
+        if not url or url in seen:
+            continue
+        seen.add(url)
+        if not _looks_like_plausible_official_page_url(url):
+            continue
+        score = _score_official_page_candidate(
+            task,
+            {
+                "url": url,
+                "title": urllib.parse.unquote(str(urllib.parse.urlparse(url).path or "")),
+                "snippet": "",
+            },
+        )
+        ranked.append((score, url))
+    ranked.sort(key=lambda item: item[0], reverse=True)
+    return [url for score, url in ranked[: max(1, int(limit))] if score > -20]
 
 
 def _select_official_page_urls(task: str, candidates: list[dict[str, str]], *, limit: int = 2) -> list[str]:
@@ -485,9 +584,31 @@ def _discover_official_page_urls(task: str, *, limit: int = 2) -> list[str]:
         except Exception:
             continue
         selected = _select_official_page_urls(task, _extract_bing_result_candidates(html_text), limit=limit)
+        selected = _sanitize_discovered_official_urls(task, selected, limit=limit)
         if selected:
             return selected
     return []
+
+
+def _url_keyword_text(url: str) -> str:
+    parsed = urllib.parse.urlparse(str(url or "").strip())
+    values: list[str] = []
+    host_labels = [label for label in str(parsed.netloc or "").lower().split(".") if label]
+    if len(host_labels) > 2:
+        for label in host_labels[:-2]:
+            cleaned = re.sub(r"[^a-z0-9가-힣]+", "", label).strip()
+            if cleaned:
+                values.append(cleaned)
+    for segment in str(parsed.path or "").split("/"):
+        decoded = urllib.parse.unquote(segment).strip()
+        if decoded:
+            values.append(decoded)
+    for entries in urllib.parse.parse_qs(str(parsed.query or "")).values():
+        for entry in entries:
+            decoded = urllib.parse.unquote(str(entry or "")).strip()
+            if decoded:
+                values.append(decoded)
+    return " ".join(values).strip()
 
 
 def _execution_style_guidance(execution_style: str) -> str:
@@ -497,7 +618,8 @@ def _execution_style_guidance(execution_style: str) -> str:
             "- Execution style for this planning run: `gui_first`.\n"
             "- Keep all steps executable in Python, but when the screenshot or current state already shows a browser page, search results, "
             "download control, installer wizard, or target app window, prefer continuing from that visible UI.\n"
-            "- If a visible download-like or installer-like control is on screen, prefer OCR-grounded click helpers before HTML scraping or fresh HTTP fetching.\n"
+            "- If a visible download-like or installer-like control is on screen, prefer screenshot-grounded GUI actions on the current page before HTML scraping, fresh HTTP fetching, or guessed installer URLs.\n"
+            "- On retries, keep the same visible page/tab first, try different page-content candidates, and avoid browser toolbar/address/tab regions as click targets.\n"
             "- Do not force direct download or silent install shortcuts when grounded visible UI progression is the safer next step.\n"
             "- For desktop software installation tasks, do not route through Microsoft Store, app stores, or package managers unless the task explicitly asks for that source. Prefer direct official vendor pages or direct official `.exe` or `.msi` installers."
         )
@@ -1057,8 +1179,9 @@ def _normalize_windows_installer_agent_prompt(
         "현재 스크린샷에 브라우저, 검색 결과, 공식 다운로드 페이지, 다운로드 버튼, 다운로드 진행 UI가 보이면 그 보이는 UI를 Python GUI 자동화로 이어서 사용하세요. "
         "현재 화면에 근거가 없을 때만 새 페이지를 여세요. "
         "근거 있는 visible browser/download UI가 이미 있으면 그 chunk 안에서 새 urllib/requests HTML scraping이나 fresh direct fetch로 갈아타지 말고, 먼저 그 UI를 끝까지 진행하세요. "
-        "보이는 download/install control 이 있으면 OCR-grounded helper 예를 들어 `click_download_like_target()` 또는 `click_text_targets([...])` 같은 helper를 우선 고려하세요. "
-        "responsive/mobile header menu 때문에 download control 이 아직 안 보이면 `open_responsive_header_menu()` 같은 helper로 그 visible menu를 먼저 여는 쪽을 우선하세요. "
+        "보이는 download/install control 이 있으면 현재 스크린샷을 보고 페이지 본문 영역의 좌표나 키보드 이동을 고르세요. direct installer URL을 추측해서 바로 받으려 하지 마세요. "
+        "같은 페이지를 다시 시도할 때는 같은 탭/페이지를 유지하고, 이전에 실패한 지점과 다른 page-content 후보를 몇 개 순차적으로 시도하세요. "
+        "브라우저 주소창, 탭 줄, 북마크 바, 빈 여백은 download 후보로 취급하지 마세요. "
         "여전히 공식 vendor source를 우선하고 `.zip`이나 archive가 아니라 Windows installer `.exe` 또는 `.msi`를 선택하세요."
     )
     gui_install_hint = (
@@ -1135,10 +1258,12 @@ def _local_install_chunks(
     normalized_style = _normalize_execution_style(execution_style)
     keyword = (_target_installer_keywords(task, limit=1) or ["targetapp"])[0]
     discovered_official_urls = _discover_official_page_urls(task, limit=2)
+    discovered_official_urls = _sanitize_discovered_official_urls(task, discovered_official_urls, limit=2)
     if not _task_explicitly_requests_store(task):
         non_store_urls = [url for url in discovered_official_urls if "apps.microsoft.com" not in str(url).lower()]
         if non_store_urls:
             discovered_official_urls = non_store_urls
+    discovered_keyword_parts = [text for text in (_url_keyword_text(url) for url in discovered_official_urls) if text]
     discovered_source_hint = ""
     if discovered_official_urls:
         discovered_lines = "\n".join(f"- {url}" for url in discovered_official_urls)
@@ -1148,11 +1273,11 @@ def _local_install_chunks(
             "Prefer the first URL if it already looks like the primary vendor or product landing page."
         )
     target_keywords: list[str] = []
-    for token in _target_installer_keywords(task, limit=6):
+    for token in _target_installer_keywords(task, *discovered_keyword_parts, limit=6):
         if token not in target_keywords:
             target_keywords.append(token)
     staging_subdir = str(staging_subdir or _task_staging_subdir(task)).strip()
-    keyword_download_glob = _downloads_installer_glob(task, *discovered_official_urls)
+    keyword_download_glob = _downloads_installer_glob(task, *discovered_keyword_parts)
     if keyword_download_glob:
         downloads_root = "%USERPROFILE%\\\\Downloads\\\\"
         downloads_glob = keyword_download_glob

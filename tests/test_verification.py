@@ -9,17 +9,19 @@ from computer_use_training_generator.teacher import (
     _decode_bing_result_url,
     _extract_bing_result_candidates,
     _looks_like_install_execution_chunk,
+    _looks_like_plausible_official_page_url,
     _merge_gui_first_navigation_chunks,
     _normalize_chunks,
     build_local_teacher_fallback,
     _normalize_general_gui_agent_prompt,
     _normalize_windows_installer_agent_prompt,
+    _sanitize_discovered_official_urls,
     _select_official_page_urls,
     _simplify_windows_installer_glob,
     _task_staging_subdir,
     _target_installer_keywords,
 )
-from computer_use_training_generator.cli import _compose_chunk_prompt
+from computer_use_training_generator.cli import _compose_chunk_prompt, _compose_retry_prompt
 from computer_use_training_generator.models import TeacherTaskChunk
 
 
@@ -310,7 +312,35 @@ def test_compose_chunk_prompt_gui_first_mentions_visible_ui() -> None:
     )
     assert "currently visible browser" in prompt
     assert "do not switch to fresh direct HTTP fetching" in prompt
-    assert "click_download_like_target()" in prompt
+    assert "use the screenshot to choose grounded page-content coordinates" in prompt
+    assert "keep that same tab/page first" in prompt
+    assert "do not click the browser toolbar, address bar, tab strip" in prompt
+
+
+def test_compose_retry_prompt_gui_first_keeps_same_page_and_download_only() -> None:
+    prompt = _compose_retry_prompt(
+        chunk=TeacherTaskChunk(
+            chunk_id="chunk-001",
+            title="Download Memoit installer",
+            agent_prompt="공식 Memoit 설치파일만 다운로드하세요.",
+            success_hint="The installer exists in Downloads.",
+            preconditions=["Windows desktop session is available"],
+            verification={"checks": [{"kind": "path_exists", "path": "~/Downloads/setup_memoit193.exe"}]},
+            max_retries=1,
+            on_fail="retry_current_chunk",
+            notes=[],
+        ),
+        verification_result={
+            "passed": False,
+            "evidence": [{"kind": "path_exists", "path": "C:\\Users\\user\\Downloads\\setup_memoit193.exe", "exists": False}],
+        },
+        attempt_index=1,
+        execution_style="gui_first",
+    )
+    assert "GUI-first retry rule: if the browser page for this chunk is already visible" in prompt
+    assert "Do not guess a new direct installer URL" in prompt
+    assert "Do not launch or silently install the installer in this chunk." in prompt
+    assert "Do not use browser toolbar/address/tab/bookmark areas as click targets." in prompt
 
 
 def test_normalize_chunks_adds_file_size_check_for_windows_download_chunk() -> None:
@@ -620,7 +650,7 @@ def test_build_local_teacher_fallback_injects_discovered_official_page_urls() ->
             cwd="..",
             error="teacher quota exhausted",
             execution_style="gui_first",
-        )
+    )
     download_chunk = teacher_plan.chunks[0]
     assert "Use these exact official page URLs first before any search engine result or inferred domain:" in download_chunk.agent_prompt
     assert "https://www.kakaocorp.com/page/service/service/KakaoTalk?lang=ko" in download_chunk.agent_prompt
@@ -628,6 +658,108 @@ def test_build_local_teacher_fallback_injects_discovered_official_page_urls() ->
         check for check in teacher_plan.chunks[1].verification["checks"] if check["kind"] == "json_marker_valid_exe"
     )
     assert "kakaotalk" in install_marker_check["keywords"]
+
+
+def test_plausible_official_page_url_filters_blog_like_article_pages() -> None:
+    assert _looks_like_plausible_official_page_url("https://moneyroan.com/desktop-notepad-memo-it/") is False
+    assert (
+        _looks_like_plausible_official_page_url(
+            "https://inoboard.com/%EB%A9%94%EB%AA%A8%EC%9E%87-%EB%8B%A4%EC%9A%B4%EB%A1%9C%EB%93%9C-%EB%B0%8F-%EC%82%AC%EC%9A%A9%EB%B2%95/"
+        )
+        is False
+    )
+    assert _looks_like_plausible_official_page_url("https://dictionary.cambridge.org/vi/translate/") is False
+    assert _looks_like_plausible_official_page_url("https://www.bookize.com/vi/translate/") is False
+    assert _looks_like_plausible_official_page_url("https://www.kakaocorp.com/page/service/service/KakaoTalk?lang=ko") is True
+
+
+def test_sanitize_discovered_official_urls_drops_blog_like_candidates() -> None:
+    urls = _sanitize_discovered_official_urls(
+        "메모잇 프로그램을 설치해줘",
+        [
+            "https://moneyroan.com/desktop-notepad-memo-it/",
+            "https://inoboard.com/%EB%A9%94%EB%AA%A8%EC%9E%87-%EB%8B%A4%EC%9A%B4%EB%A1%9C%EB%93%9C-%EB%B0%8F-%EC%82%AC%EC%9A%A9%EB%B2%95/",
+        ],
+    )
+    assert urls == []
+
+
+def test_sanitize_discovered_official_urls_drops_reference_like_candidates() -> None:
+    urls = _sanitize_discovered_official_urls(
+        "메모잇 프로그램을 설치해줘",
+        [
+            "https://dictionary.cambridge.org/vi/translate/",
+            "https://www.bookize.com/vi/translate/",
+        ],
+    )
+    assert urls == []
+
+
+def test_build_local_teacher_fallback_does_not_use_blog_host_for_download_glob_or_exact_urls() -> None:
+    with patch(
+        "computer_use_training_generator.teacher._discover_official_page_urls",
+        return_value=[
+            "https://moneyroan.com/desktop-notepad-memo-it/",
+            "https://inoboard.com/%EB%A9%94%EB%AA%A8%EC%9E%87-%EB%8B%A4%EC%9A%B4%EB%A1%9C%EB%93%9C-%EB%B0%8F-%EC%82%AC%EC%9A%A9%EB%B2%95/",
+        ],
+    ):
+        _, teacher_plan = build_local_teacher_fallback(
+            task="메모잇 프로그램을 설치해줘",
+            prompt="dummy prompt",
+            command_template="codex exec '{prompt}'",
+            cwd="..",
+            error="teacher quota exhausted",
+            execution_style="gui_first",
+        )
+    download_chunk = teacher_plan.chunks[0]
+    assert "moneyroan.com" not in download_chunk.agent_prompt
+    assert "inoboard.com" not in download_chunk.agent_prompt
+    checks = download_chunk.verification["checks"]
+    assert not any("moneyroan" in check.get("pattern", "") for check in checks if check["kind"] == "file_exists_glob")
+
+
+def test_build_local_teacher_fallback_does_not_use_reference_host_for_download_glob_or_exact_urls() -> None:
+    with patch(
+        "computer_use_training_generator.teacher._discover_official_page_urls",
+        return_value=[
+            "https://dictionary.cambridge.org/vi/translate/",
+            "https://www.bookize.com/vi/translate/",
+        ],
+    ):
+        _, teacher_plan = build_local_teacher_fallback(
+            task="메모잇 프로그램을 설치해줘",
+            prompt="dummy prompt",
+            command_template="codex exec '{prompt}'",
+            cwd="..",
+            error="teacher quota exhausted",
+            execution_style="gui_first",
+        )
+    download_chunk = teacher_plan.chunks[0]
+    assert "dictionary.cambridge.org" not in download_chunk.agent_prompt
+    assert "bookize.com" not in download_chunk.agent_prompt
+    checks = download_chunk.verification["checks"]
+    assert not any("dictionary" in check.get("pattern", "") for check in checks if check["kind"] == "file_exists_glob")
+
+
+def test_build_local_teacher_fallback_can_use_safe_subdomain_product_token_for_glob() -> None:
+    with patch(
+        "computer_use_training_generator.teacher._discover_official_page_urls",
+        return_value=[
+            "http://mydev.kr/",
+            "https://memoit.filei.co.kr/",
+        ],
+    ):
+        _, teacher_plan = build_local_teacher_fallback(
+            task="메모잇 프로그램을 설치해줘",
+            prompt="dummy prompt",
+            command_template="codex exec '{prompt}'",
+            cwd="..",
+            error="teacher quota exhausted",
+            execution_style="gui_first",
+        )
+    download_chunk = teacher_plan.chunks[0]
+    checks = download_chunk.verification["checks"]
+    assert any(check.get("pattern") == "~/Downloads/*memoit*.exe" for check in checks if check["kind"] == "file_exists_glob")
 
 
 def test_normalize_chunks_replaces_store_detour_plan_for_windows_installer_task() -> None:
