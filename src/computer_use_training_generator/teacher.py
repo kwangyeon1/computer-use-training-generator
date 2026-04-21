@@ -52,10 +52,10 @@ Requirements:
 - If the original answer contains official URLs or important warnings, keep them in the relevant chunk prompt.
 - For software download/install chunks, include at least one exact official vendor or official release URL directly in `agent_prompt` whenever you know one from the task, teacher answer, or your own planning. Do not leave the agent to infer the base domain from product names alone.
 - Each chunk must include a read-only verification plan.
-- Verification must use only the allowed check kinds: `path_exists`, `file_exists_glob`, `file_size_gt`, `process_exists`.
+- Verification must use only the allowed check kinds: `path_exists`, `file_exists_glob`, `file_size_gt`, `process_exists`, `json_marker_valid_installer`, `json_marker_valid_exe`.
 - All verification checks are combined with logical AND.
 - If you need to allow multiple possible installer filenames, use one broad glob that matches all acceptable names instead of multiple alternative checks.
-- For Windows installer download chunks, prefer a broad installer glob such as `~/Downloads/*vendor*.exe`; official `.msi` installers are also acceptable when that is the vendor-provided Windows installer.
+- For GUI-first Windows installer download chunks, prefer `json_marker_valid_installer` on the soft continuity file instead of requiring the final filename to contain the app name. For Python-first chunks, a broad installer glob such as `~/Downloads/*vendor*.exe` is acceptable; official `.msi` installers are also acceptable when that is the vendor-provided Windows installer.
 - Do not output raw Python for verification.
 - `preconditions` should describe what must already be true before the chunk starts.
 - `max_retries` should be a small integer, usually 0, 1, or 2.
@@ -1273,9 +1273,20 @@ def _local_install_chunks(
             "Prefer the first URL if it already looks like the primary vendor or product landing page."
         )
     target_keywords: list[str] = []
-    for token in _target_installer_keywords(task, *discovered_keyword_parts, limit=6):
+    task_keywords = _target_installer_keywords(task, limit=6)
+    discovered_keywords = _target_installer_keywords(*discovered_keyword_parts, limit=6)
+    for token in task_keywords:
         if token not in target_keywords:
             target_keywords.append(token)
+    task_has_ascii_keyword = any(re.search(r"[a-z]", token) for token in target_keywords)
+    if not task_has_ascii_keyword:
+        for token in discovered_keywords:
+            if re.search(r"[a-z]", token) is None:
+                continue
+            if token not in target_keywords:
+                target_keywords.append(token)
+            if len(target_keywords) >= 6:
+                break
     staging_subdir = str(staging_subdir or _task_staging_subdir(task)).strip()
     keyword_download_glob = _downloads_installer_glob(task, *discovered_keyword_parts)
     if keyword_download_glob:
@@ -1295,12 +1306,28 @@ def _local_install_chunks(
     install_title = f"Install {keyword}"
     launch_title = f"Launch {keyword}"
     if normalized_style == "gui_first":
+        download_verification_checks = [
+            {
+                "kind": "json_marker_valid_installer",
+                "path": context_path,
+                "field": "installer_path",
+                "keywords": target_keywords,
+                "bytes": 1000000,
+            }
+        ]
+    else:
+        download_verification_checks = [
+            {"kind": "file_exists_glob", "pattern": downloads_glob},
+            {"kind": "file_size_gt", "pattern": downloads_glob, "bytes": 1000000},
+        ]
+    if normalized_style == "gui_first":
         download_prompt = (
             f"Use executable Python on the Windows machine to obtain the official Windows installer `.exe` or `.msi` for the target app from this task: {task}. "
             f"First inspect the current screenshot and desktop state. If a browser, search results page, official vendor page, or download control is already visible, continue from that visible UI with Python automation and download the installer into `{downloads_root}`. "
             f"If no grounded visible UI exists yet, open the official vendor site or official release page in Python and continue there. "
             f"If the soft continuity file `{context_path}` already points to a valid installer for this task and that file still exists, you may reuse it instead of downloading again, but validate it before trusting it. "
-            f"If you confirm or obtain a valid installer, update `{context_path}` with the exact installer path so later chunks can continue from it. "
+            f"Do not require the final downloaded filename to contain the app name; browser downloads may use temporary or vendor-specific filenames. "
+            f"If you confirm or obtain a valid installer, update `{context_path}` with the exact installer path, source URL, and target keywords so later chunks can continue from it. "
             f"Do not use `.zip`, portable, or archive downloads."
         )
         install_prompt = (
@@ -1360,10 +1387,7 @@ def _local_install_chunks(
                 "The machine has network access to the official vendor or release pages.",
             ],
             verification={
-                "checks": [
-                    {"kind": "file_exists_glob", "pattern": downloads_glob},
-                    {"kind": "file_size_gt", "pattern": downloads_glob, "bytes": 1000000},
-                ]
+                "checks": download_verification_checks
             },
             max_retries=1,
             on_fail="retry_current_chunk",

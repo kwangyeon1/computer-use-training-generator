@@ -59,6 +59,17 @@ def test_has_file_based_checks_detects_download_verifiers() -> None:
         }
     )
     assert not _has_file_based_checks({"checks": [{"kind": "process_exists", "name": "DBeaver.exe"}]})
+    assert _has_file_based_checks(
+        {
+            "checks": [
+                {
+                    "kind": "json_marker_valid_installer",
+                    "path": "~/Downloads/computer-use-agent-context.json",
+                    "field": "installer_path",
+                }
+            ]
+        }
+    )
 
 
 def test_build_verification_code_searches_expanded_patterns() -> None:
@@ -92,6 +103,26 @@ def test_build_verification_code_supports_json_marker_valid_exe() -> None:
     )
     assert code is not None
     assert "_validate_json_marker_exe" in code
+
+
+def test_build_verification_code_supports_json_marker_valid_installer() -> None:
+    code = build_verification_code(
+        {
+            "checks": [
+                {
+                    "kind": "json_marker_valid_installer",
+                    "path": "~/Downloads/computer-use-agent-context.json",
+                    "field": "installer_path",
+                    "keywords": ["targetapp"],
+                    "bytes": 1000000,
+                }
+            ]
+        }
+    )
+    assert code is not None
+    assert "_validate_json_marker_installer" in code
+    assert "source_url" in code
+    assert 'allowed_suffixes = {".exe", ".msi"}' in code
 
 
 def test_install_execution_chunk_does_not_match_download_stage_prompt() -> None:
@@ -600,7 +631,9 @@ def test_build_local_teacher_fallback_for_korean_task_uses_real_app_token() -> N
     assert "카카오톡" in download_chunk.agent_prompt
     assert "computer-use-agent-context.json" in download_chunk.agent_prompt
     checks = download_chunk.verification["checks"]
-    assert any(check["pattern"] == "~/Downloads/*kakaotalk*.exe" for check in checks if check["kind"] == "file_exists_glob")
+    download_marker_check = next(check for check in checks if check["kind"] == "json_marker_valid_installer")
+    assert download_marker_check["path"] == "~/Downloads/computer-use-agent-context.json"
+    assert "kakaotalk" in download_marker_check["keywords"]
     install_checks = teacher_plan.chunks[1].verification["checks"]
     marker_check = next(check for check in install_checks if check["kind"] == "json_marker_valid_exe")
     assert "카카오톡" in marker_check["keywords"]
@@ -628,11 +661,9 @@ def test_build_local_teacher_fallback_uses_supplied_staging_subdir() -> None:
     download_chunk = teacher_plan.chunks[0]
     assert "computer-use-agent-context.json" in download_chunk.agent_prompt
     assert "custom-stage-1234" not in download_chunk.agent_prompt
-    assert any(
-        check.get("pattern") == "~/Downloads/*kakaotalk*.exe"
-        for check in download_chunk.verification["checks"]
-        if check["kind"] == "file_exists_glob"
-    )
+    marker_check = next(check for check in download_chunk.verification["checks"] if check["kind"] == "json_marker_valid_installer")
+    assert marker_check["path"] == "~/Downloads/computer-use-agent-context.json"
+    assert "kakaotalk" in marker_check["keywords"]
 
 
 def test_build_local_teacher_fallback_injects_discovered_official_page_urls() -> None:
@@ -741,7 +772,7 @@ def test_build_local_teacher_fallback_does_not_use_reference_host_for_download_g
     assert not any("dictionary" in check.get("pattern", "") for check in checks if check["kind"] == "file_exists_glob")
 
 
-def test_build_local_teacher_fallback_can_use_safe_subdomain_product_token_for_glob() -> None:
+def test_build_local_teacher_fallback_uses_context_marker_for_gui_first_download() -> None:
     with patch(
         "computer_use_training_generator.teacher._discover_official_page_urls",
         return_value=[
@@ -759,7 +790,10 @@ def test_build_local_teacher_fallback_can_use_safe_subdomain_product_token_for_g
         )
     download_chunk = teacher_plan.chunks[0]
     checks = download_chunk.verification["checks"]
-    assert any(check.get("pattern") == "~/Downloads/*memoit*.exe" for check in checks if check["kind"] == "file_exists_glob")
+    marker_checks = [check for check in checks if check["kind"] == "json_marker_valid_installer"]
+    assert marker_checks
+    assert marker_checks[0]["path"] == "~/Downloads/computer-use-agent-context.json"
+    assert "memoit" in marker_checks[0]["keywords"]
 
 
 def test_normalize_chunks_replaces_store_detour_plan_for_windows_installer_task() -> None:

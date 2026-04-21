@@ -161,13 +161,16 @@ def _extract_verified_installer_paths(verification_result: dict | None) -> list[
         if not isinstance(entry, dict):
             continue
         kind = str(entry.get("kind") or "")
-        if kind not in {"path_exists", "file_exists_glob", "file_size_gt"}:
+        if kind not in {"path_exists", "file_exists_glob", "file_size_gt", "json_marker_valid_installer"}:
             continue
         candidates: list[str] = []
         path_value = str(entry.get("path") or "").strip()
         pattern_value = str(entry.get("pattern") or "").strip()
+        resolved_path_value = str(entry.get("resolved_path") or "").strip()
         if path_value:
             candidates.append(path_value)
+        if resolved_path_value:
+            candidates.append(resolved_path_value)
         if pattern_value.lower().endswith((".exe", ".msi")) and "*" not in pattern_value:
             candidates.append(pattern_value)
         matches = entry.get("matches") or []

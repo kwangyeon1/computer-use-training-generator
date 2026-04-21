@@ -18,6 +18,7 @@ _ALLOWED_CHECK_KINDS = {
     "file_size_gt",
     "process_exists",
     "json_marker_valid_exe",
+    "json_marker_valid_installer",
 }
 
 _VERIFICATION_RETRY_DELAY_S = 2.0
@@ -70,13 +71,19 @@ def _normalize_verification_spec(verification: dict[str, object] | None) -> dict
             if not name:
                 continue
             normalized["name"] = name
-        elif kind == "json_marker_valid_exe":
+        elif kind in {"json_marker_valid_exe", "json_marker_valid_installer"}:
             path = str(item.get("path") or "").strip()
             if not path:
                 continue
-            field = str(item.get("field") or "installed_exe").strip() or "installed_exe"
+            default_field = "installed_exe" if kind == "json_marker_valid_exe" else "installer_path"
+            field = str(item.get("field") or default_field).strip() or default_field
             normalized["path"] = path
             normalized["field"] = field
+            if kind == "json_marker_valid_installer":
+                try:
+                    normalized["bytes"] = max(0, int(item.get("bytes") or 0))
+                except (TypeError, ValueError):
+                    normalized["bytes"] = 0
             raw_keywords = item.get("keywords")
             if isinstance(raw_keywords, list):
                 keywords = []
@@ -165,7 +172,7 @@ def _has_file_based_checks(verification: dict[str, object] | None) -> bool:
         return False
     for check in normalized["checks"]:
         kind = str(check.get("kind") or "").strip()
-        if kind in {"file_exists_glob", "file_size_gt"}:
+        if kind in {"file_exists_glob", "file_size_gt", "json_marker_valid_installer"}:
             return True
     return False
 
@@ -336,6 +343,67 @@ def _validate_json_marker_exe(marker_path, field, keywords):
     return ok, entry
 
 
+def _validate_json_marker_installer(marker_path, field, keywords, min_bytes):
+    expanded_marker = os.path.expanduser(str(marker_path or ""))
+    marker = Path(expanded_marker)
+    entry = {{
+        "path": expanded_marker,
+        "field": field,
+    }}
+    if not marker.exists():
+        entry["exists"] = False
+        return False, entry
+    entry["exists"] = True
+    try:
+        payload = json.loads(marker.read_text(encoding="utf-8"))
+    except Exception as exc:
+        entry["error"] = f"invalid_json: {{exc}}"
+        return False, entry
+    if not isinstance(payload, dict):
+        payload = {{}}
+    raw_candidate = str(payload.get(field) or "").strip().strip('"')
+    entry["value"] = raw_candidate
+    if not raw_candidate:
+        entry["error"] = "missing_field_value"
+        return False, entry
+    candidate = Path(os.path.expandvars(os.path.expanduser(raw_candidate)))
+    entry["resolved_path"] = str(candidate)
+    entry["candidate_exists"] = candidate.exists()
+    entry["suffix"] = candidate.suffix.lower()
+    entry["bytes"] = None
+    if candidate.exists() and candidate.is_file():
+        try:
+            entry["bytes"] = candidate.stat().st_size
+        except OSError:
+            entry["bytes"] = None
+    normalized_keywords = _normalize_keywords(keywords)
+    marker_keywords = payload.get("target_keywords") or []
+    if not isinstance(marker_keywords, list):
+        marker_keywords = []
+    source_url = str(payload.get("source_url") or "")
+    keyword_haystack = " ".join(
+        [
+            str(candidate).lower(),
+            source_url.lower(),
+            " ".join(str(item).lower() for item in marker_keywords),
+        ]
+    )
+    keyword_hits = [keyword for keyword in normalized_keywords if keyword in keyword_haystack]
+    entry["keywords"] = normalized_keywords
+    entry["marker_target_keywords"] = marker_keywords
+    entry["source_url"] = source_url
+    entry["keyword_hits"] = keyword_hits
+    allowed_suffixes = {{".exe", ".msi"}}
+    ok = (
+        candidate.exists()
+        and candidate.is_file()
+        and candidate.suffix.lower() in allowed_suffixes
+        and (entry["bytes"] or 0) > int(min_bytes or 0)
+        and (not normalized_keywords or bool(keyword_hits))
+    )
+    return ok, entry
+
+
 evidence = []
 passed = True
 
@@ -382,6 +450,13 @@ for check in CHECKS:
         field = str(check.get("field") or "installed_exe")
         keywords = check.get("keywords") or []
         ok, marker_entry = _validate_json_marker_exe(path, field, keywords)
+        entry.update(marker_entry)
+    elif kind == "json_marker_valid_installer":
+        path = str(check.get("path") or "")
+        field = str(check.get("field") or "installer_path")
+        keywords = check.get("keywords") or []
+        min_bytes = int(check.get("bytes") or 0)
+        ok, marker_entry = _validate_json_marker_installer(path, field, keywords, min_bytes)
         entry.update(marker_entry)
     else:
         entry["error"] = "unsupported_check_kind"
