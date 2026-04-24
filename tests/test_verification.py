@@ -1,3 +1,4 @@
+import json
 from unittest.mock import patch
 
 from computer_use_training_generator.verification import (
@@ -9,6 +10,7 @@ from computer_use_training_generator.teacher import (
     _decode_bing_result_url,
     _extract_bing_result_candidates,
     _extract_link_candidate_urls,
+    _format_replan_link_candidate_exclusions,
     _looks_like_install_execution_chunk,
     _looks_like_plausible_official_page_url,
     _looks_like_store_detour_prompt,
@@ -24,9 +26,12 @@ from computer_use_training_generator.teacher import (
     _target_installer_keywords,
 )
 from computer_use_training_generator.cli import (
+    _collect_retry_link_request_exclusions,
     _compose_chunk_prompt,
     _compose_retry_prompt,
     _extract_verified_installer_paths,
+    _extract_retry_exclusion_urls_and_queries,
+    _initial_chunk_candidate_urls,
     _teacher_link_candidate_urls_from_result,
     _should_stop_after_install_completion,
     _teacher_execution_style_context,
@@ -79,15 +84,128 @@ def test_compose_retry_prompt_includes_teacher_candidate_urls() -> None:
         ],
     )
 
-    assert "Teacher-provided candidate page URLs for this retry" in prompt
+    assert "Explicit open-target page URLs for this chunk" in prompt
     assert "- https://example.com/download" in prompt
-    assert "Open these pages in order before generic search" in prompt
+    assert "Use the explicit open-target URLs listed above before generic search" in prompt
+
+
+def test_compose_chunk_prompt_includes_explicit_open_targets() -> None:
+    chunk = TeacherTaskChunk(
+        chunk_id="chunk-001",
+        title="Download installer",
+        agent_prompt="Download the Windows installer into Downloads.",
+        success_hint="installer exists",
+        verification={"checks": [{"kind": "json_marker_valid_installer"}]},
+        max_retries=1,
+        on_fail="retry_current_chunk",
+    )
+
+    prompt = _compose_chunk_prompt(
+        chunk,
+        execution_style="gui_first",
+        candidate_urls=["https://mydev.kr/", "https://mydev.kr/download.php"],
+    )
+
+    assert "Explicit open-target page URLs for this chunk" in prompt
+    assert "- https://mydev.kr/" in prompt
+    assert "primary runtime open targets" in prompt
 
 
 def test_teacher_link_candidate_urls_from_result_parses_normalized_response() -> None:
     text = '{"candidate_urls":["https://example.com/download","ftp://bad"],"raw_response":"{}"}'
 
     assert _teacher_link_candidate_urls_from_result(text) == ["https://example.com/download"]
+
+
+def test_format_replan_link_candidate_exclusions_lists_failed_urls_and_queries() -> None:
+    text = _format_replan_link_candidate_exclusions(
+        failed_candidate_urls=["https://mydev.kr/", "https://mydev.kr/download.php"],
+        failed_search_queries=["메모잇 memoit193 kr", "메모잇 다운로드 windows"],
+    )
+
+    assert "Previously failed URLs to exclude" in text
+    assert "- https://mydev.kr/" in text
+    assert "Previously failed search queries to exclude" in text
+    assert "- 메모잇 memoit193 kr" in text
+
+
+def test_extract_retry_exclusion_urls_and_queries_filters_search_engine_urls() -> None:
+    text = (
+        "PROMPT_URL = 'https://mydev.kr/'\n"
+        "FALLBACK_SEARCH_URL = "
+        "'https://www.google.com/search?q=%EB%A9%94%EB%AA%A8%EC%9E%87+memoit193+kr'\n"
+    )
+
+    urls, queries = _extract_retry_exclusion_urls_and_queries(text)
+
+    assert urls == ["https://mydev.kr/"]
+    assert queries == ["메모잇 memoit193 kr"]
+
+
+def test_collect_retry_link_request_exclusions_reads_prior_attempt_artifacts(tmp_path) -> None:
+    session_root = tmp_path
+    agent_runs = session_root / "agent_runs"
+    agent_runs.mkdir(parents=True)
+    (agent_runs / "chunk-001.attempt-01.json").write_text(
+        json.dumps(
+            {
+                "executor_payload": {
+                    "executed_python_code": (
+                        "PROMPT_URL = 'https://mydev.kr/'\n"
+                        "FALLBACK_SEARCH_URL = "
+                        "'https://www.google.com/search?q=%EB%A9%94%EB%AA%A8%EC%9E%87+memoit193+kr'\n"
+                    )
+                }
+            },
+            ensure_ascii=False,
+        ),
+        encoding="utf-8",
+    )
+    (agent_runs / "chunk-001.attempt-01.teacher_link_candidates.json").write_text(
+        json.dumps(
+            {
+                "candidate_urls": [
+                    "https://mydev.kr/",
+                    "https://mydev.kr/download.php",
+                ]
+            },
+            ensure_ascii=False,
+        ),
+        encoding="utf-8",
+    )
+
+    urls, queries = _collect_retry_link_request_exclusions(
+        session_root=session_root,
+        retry_agent_run_label="chunk-001.attempt-02",
+    )
+
+    assert "https://mydev.kr/" in urls
+    assert "https://mydev.kr/download.php" in urls
+    assert queries == ["메모잇 memoit193 kr"]
+
+
+def test_initial_chunk_candidate_urls_merges_task_and_teacher_urls() -> None:
+    chunk = TeacherTaskChunk(
+        chunk_id="chunk-001",
+        title="Download installer",
+        agent_prompt="Open the relevant download page and fetch the installer.",
+        success_hint="installer exists",
+        verification={"checks": [{"kind": "json_marker_valid_installer"}]},
+        max_retries=1,
+        on_fail="retry_current_chunk",
+    )
+
+    urls = _initial_chunk_candidate_urls(
+        task="https://www.filezilla.kr/theme/filezilla/download/FileZilla_3.67.0_win64-setup.exe에서 filezilla 설치해줘",
+        chunk=chunk,
+        teacher_text="Use https://mydev.kr/ if the main vendor page is needed.",
+        teacher_plan_source_text="",
+    )
+
+    assert urls == [
+        "https://www.filezilla.kr/theme/filezilla/download/FileZilla_3.67.0_win64-setup.exe",
+        "https://mydev.kr/",
+    ]
 
 
 def test_extract_verified_installer_paths_skips_keyword_mismatched_marker() -> None:

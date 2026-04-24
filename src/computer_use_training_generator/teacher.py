@@ -98,10 +98,15 @@ Chunk prompt:
 Failure/verifier context:
 {failure_context}
 
+Previously failed attempts to exclude from the next retry:
+{retry_exclusions}
+
 Requirements:
 - Output exactly one JSON object with this shape: {{"candidate_urls":["https://..."],"notes":"short optional reason"}}
 - Return 1 to 5 absolute http(s) page URLs, not prose.
 - Prefer vendor/product/download/release landing pages that are relevant to the exact target product keywords in the task.
+- Do not return a page URL that is already listed in the excluded failed-attempt URLs.
+- If excluded failed search queries are listed, avoid repeating those same failed searches as the primary retrieval path.
 - Do not return search-engine result URLs, app-store URLs, YouTube, blogs, tutorials, reviews, forums, social media, or unrelated software pages.
 - It is acceptable to include non-official but clearly product-specific download pages when the official page failed.
 - Do not invent versioned installer artifact filenames. Return page URLs that the agent can open and inspect.
@@ -1928,6 +1933,48 @@ def _extract_link_candidate_urls(text: str, *, task: str, limit: int = 5) -> lis
     return kept
 
 
+def _format_replan_link_candidate_exclusions(
+    *,
+    failed_candidate_urls: list[str] | None = None,
+    failed_search_queries: list[str] | None = None,
+    limit: int = 8,
+) -> str:
+    sections: list[str] = []
+    normalized_urls: list[str] = []
+    normalized_queries: list[str] = []
+    seen_urls: set[str] = set()
+    seen_queries: set[str] = set()
+    for raw_url in failed_candidate_urls or []:
+        url = str(raw_url or "").strip()
+        if not url or url in seen_urls:
+            continue
+        seen_urls.add(url)
+        normalized_urls.append(url)
+        if len(normalized_urls) >= limit:
+            break
+    for raw_query in failed_search_queries or []:
+        query = re.sub(r"\s+", " ", str(raw_query or "").strip())
+        if not query or query in seen_queries:
+            continue
+        seen_queries.add(query)
+        normalized_queries.append(query)
+        if len(normalized_queries) >= limit:
+            break
+    if normalized_urls:
+        sections.append(
+            "Previously failed URLs to exclude:\n"
+            + "\n".join(f"- {url}" for url in normalized_urls)
+        )
+    if normalized_queries:
+        sections.append(
+            "Previously failed search queries to exclude:\n"
+            + "\n".join(f"- {query}" for query in normalized_queries)
+        )
+    if not sections:
+        return "- None."
+    return "\n\n".join(sections)
+
+
 def run_teacher_link_candidates(
     *,
     task: str,
@@ -1938,12 +1985,18 @@ def run_teacher_link_candidates(
     cwd: str | None,
     timeout_s: float,
     limit: int = 5,
+    failed_candidate_urls: list[str] | None = None,
+    failed_search_queries: list[str] | None = None,
 ) -> TeacherResult:
     prompt = _REPLAN_LINK_CANDIDATE_PROMPT_TEMPLATE.format(
         task=task.strip(),
         chunk_title=chunk_title.strip(),
         chunk_prompt=chunk_prompt.strip(),
         failure_context=failure_context.strip(),
+        retry_exclusions=_format_replan_link_candidate_exclusions(
+            failed_candidate_urls=failed_candidate_urls,
+            failed_search_queries=failed_search_queries,
+        ),
     )
     result, response_text = _run_teacher_command(
         prompt=prompt,
