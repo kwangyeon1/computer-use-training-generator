@@ -21,7 +21,14 @@ from .collector import (
 )
 from .config_utils import load_generator_config
 from .models import TeacherChunkPlanResult, TeacherTaskChunk
-from .teacher import _task_staging_subdir, build_local_teacher_fallback, run_teacher, split_teacher_response
+from .teacher import (
+    _target_installer_keywords,
+    _task_staging_subdir,
+    build_local_teacher_fallback,
+    run_teacher_link_candidates,
+    run_teacher,
+    split_teacher_response,
+)
 from .verification import run_chunk_verification, write_verification_artifact
 
 
@@ -127,15 +134,9 @@ def _compose_chunk_prompt(chunk: TeacherTaskChunk, *, execution_style: str = "py
     normalized_style = _normalize_execution_style(execution_style)
     if normalized_style == "gui_first":
         prefix = (
-            "Return executable Python only for this chunk. Prefer continuing from the currently visible browser, "
-            "search results, download UI, app window, or installer dialog when that UI is already on screen. "
-            "Do not ask a human to perform manual GUI actions outside the generated Python. "
-            "If grounded visible browser/download/installer UI is already available, do not switch to fresh direct HTTP fetching, "
-            "HTML scraping, or silent-install shortcuts in the same step unless the latest execution proves that UI path stalled. "
-            "If a visible download-like or installer-like control is on screen, use the screenshot to choose grounded "
-            "page-content coordinates or keyboard actions instead of guessing a fresh installer URL. "
-            "When retrying on the same page, keep that same tab/page first, avoid previously failed points, try a few distinct "
-            "visible page-content candidates, and do not click the browser toolbar, address bar, tab strip, bookmarks bar, or blank margins."
+            "Return executable Python only for this chunk. Continue from the currently visible browser, download UI, "
+            "app window, or installer dialog when that state is already on screen. Use screenshot-grounded page-content "
+            "actions first, avoid toolbar/address/tab/bookmark/blank-margin clicks, and do not ask a human to take manual GUI actions."
         )
     else:
         prefix = (
@@ -159,6 +160,12 @@ def _extract_verified_installer_paths(verification_result: dict | None) -> list[
     seen: set[str] = set()
     for entry in evidence:
         if not isinstance(entry, dict):
+            continue
+        if entry.get("passed") is False:
+            continue
+        keywords = [str(item).strip().lower() for item in (entry.get("keywords") or []) if str(item).strip()]
+        keyword_hits = [str(item).strip().lower() for item in (entry.get("keyword_hits") or []) if str(item).strip()]
+        if keywords and not keyword_hits:
             continue
         kind = str(entry.get("kind") or "")
         if kind not in {"path_exists", "file_exists_glob", "file_size_gt", "json_marker_valid_installer"}:
@@ -214,6 +221,7 @@ def _compose_retry_prompt(
     attempt_index: int,
     execution_style: str = "python_first",
     prior_verification_result: dict | None = None,
+    candidate_urls: list[str] | None = None,
 ) -> str:
     evidence = verification_result.get("evidence")
     error = verification_result.get("error")
@@ -225,6 +233,13 @@ def _compose_retry_prompt(
         details.append(f"Verifier error: {error}")
     details.append(f"Verifier evidence:\n{evidence_text}")
     if normalized_style == "gui_first":
+        retry_target_keywords = _target_installer_keywords(
+            chunk.title,
+            chunk.agent_prompt,
+            chunk.success_hint or "",
+            *chunk.preconditions,
+            limit=6,
+        )
         details.append(
             "GUI-first retry rule: if the browser page for this chunk is already visible, stay on that same page/tab first. "
             "Do not guess a new direct installer URL before exhausting the visible page-content path."
@@ -237,9 +252,109 @@ def _compose_retry_prompt(
             "If one visible coordinate candidate does not progress, try a different visible page-content candidate in the same script. "
             "Do not use browser toolbar/address/tab/bookmark areas as click targets."
         )
+        if retry_target_keywords:
+            details.append(
+                "If you must abandon the current page and run a new browser search, keep these exact task/product keywords in the query: "
+                + ", ".join(retry_target_keywords)
+                + "."
+            )
+            details.append(
+                "Do not replace those task/product keywords with generic retry wording, verifier artifact names, or unrelated product names."
+            )
+    if candidate_urls:
+        url_lines = "\n".join(f"- {url}" for url in candidate_urls[:5])
+        details.append(
+            "Teacher-provided candidate page URLs for this retry. Open these pages in order before generic search, "
+            "but still verify the visible page/download result matches this chunk target:\n"
+            f"{url_lines}"
+        )
     prompt_text = _compose_chunk_prompt(chunk, execution_style=execution_style)
     prompt_text = _append_verified_installer_hint(prompt_text, prior_verification_result)
     return prompt_text + "\n\n" + "\n\n".join(details)
+
+
+def _chunk_looks_like_download_retry(chunk: TeacherTaskChunk) -> bool:
+    combined = " ".join(
+        str(part or "")
+        for part in (
+            chunk.title,
+            chunk.agent_prompt,
+            chunk.success_hint,
+            json.dumps(chunk.verification or {}, ensure_ascii=False),
+        )
+    ).lower()
+    return any(token in combined for token in ("download", "다운로드", "installer", "설치파일", ".exe", ".msi"))
+
+
+def _teacher_link_candidate_urls_from_result(result_text: str) -> list[str]:
+    try:
+        payload = json.loads(result_text)
+    except json.JSONDecodeError:
+        return []
+    urls = payload.get("candidate_urls")
+    if not isinstance(urls, list):
+        return []
+    cleaned: list[str] = []
+    seen: set[str] = set()
+    for raw_url in urls:
+        url = str(raw_url or "").strip()
+        if not url.startswith(("http://", "https://")):
+            continue
+        if url in seen:
+            continue
+        seen.add(url)
+        cleaned.append(url)
+    return cleaned
+
+
+def _request_teacher_retry_link_candidates(
+    *,
+    task: str,
+    chunk: TeacherTaskChunk,
+    verification_result: dict | None,
+    teacher_command_template: str,
+    teacher_workdir: str | None,
+    teacher_timeout_s: float,
+    session_root: Path,
+    agent_run_label: str,
+    execution_style: str,
+) -> list[str]:
+    if _normalize_execution_style(execution_style) != "gui_first":
+        return []
+    if not _chunk_looks_like_download_retry(chunk):
+        return []
+    if not str(teacher_command_template or "").strip():
+        return []
+    failure_context = json.dumps(verification_result or {}, ensure_ascii=False, indent=2)
+    try:
+        result = run_teacher_link_candidates(
+            task=task,
+            chunk_title=chunk.title,
+            chunk_prompt=chunk.agent_prompt,
+            failure_context=failure_context,
+            command_template=teacher_command_template,
+            cwd=teacher_workdir,
+            timeout_s=min(max(float(teacher_timeout_s), 30.0), 180.0),
+            limit=5,
+        )
+    except Exception as exc:
+        payload = {"ok": False, "error": str(exc), "candidate_urls": []}
+        path = session_root / "agent_runs" / f"{agent_run_label}.teacher_link_candidates.json"
+        path.parent.mkdir(parents=True, exist_ok=True)
+        path.write_text(json.dumps(payload, ensure_ascii=False, indent=2), encoding="utf-8")
+        return []
+    candidate_urls = _teacher_link_candidate_urls_from_result(result.response_text)
+    payload = {
+        "ok": True,
+        "teacher_prompt": result.prompt,
+        "teacher_response": result.response_text,
+        "candidate_urls": candidate_urls,
+        "command_result": asdict(result.command_result),
+    }
+    path = session_root / "agent_runs" / f"{agent_run_label}.teacher_link_candidates.json"
+    path.parent.mkdir(parents=True, exist_ok=True)
+    path.write_text(json.dumps(payload, ensure_ascii=False, indent=2), encoding="utf-8")
+    return candidate_urls
 
 
 def _teacher_execution_style_context(execution_style: str) -> str:
@@ -249,12 +364,17 @@ def _teacher_execution_style_context(execution_style: str) -> str:
             "Plan for GUI-first automation. The agent still returns executable Python only, but when the current "
             "screenshot already shows a browser page, search results, a download control, an installer wizard, a UAC "
             "prompt, or an app window, prefer advancing that visible UI state before replacing it with a fresh direct "
-            "download or silent-install shortcut."
+            "download or silent-install shortcut. For desktop software installation tasks, do not route through "
+            "Microsoft Store, app stores, winget, package managers, or app-store web listings unless the user "
+            "explicitly requests that source; prefer a relevant vendor, product, or download page and a Windows "
+            "`.exe`/`.msi` installer when one is available."
         )
     return (
-        "Plan for Python-first automation. Prefer deterministic Python flows such as direct official URL download, "
+        "Plan for Python-first automation. Prefer deterministic Python flows such as direct URL download, "
         "file verification in Downloads, subprocess-based installer launch, and Python GUI automation only for the "
-        "remaining dialogs."
+        "remaining dialogs. For desktop software installation tasks, do not route through Microsoft Store, app "
+        "stores, winget, package managers, or app-store web listings unless the user explicitly requests that source; "
+        "prefer a relevant vendor, product, or download page and a Windows `.exe`/`.msi` installer when one is available."
     )
 
 
@@ -262,6 +382,56 @@ def _chunk_completed_from_agent_payload(payload: dict) -> bool:
     summary = payload.get("summary") or {}
     final_response = summary.get("final_response") or {}
     return bool(final_response.get("done")) or str(summary.get("stopped_reason") or "") == "task_completed"
+
+
+def _task_requests_post_install_launch(task: str) -> bool:
+    lowered = str(task or "").lower()
+    return any(
+        token in lowered
+        for token in (
+            "launch",
+            "run",
+            "open",
+            "start",
+            "execute",
+            "실행",
+            "열어",
+            "켜줘",
+            "시작",
+        )
+    )
+
+
+def _should_stop_after_install_completion(task: str, chunk: TeacherTaskChunk) -> bool:
+    if _task_requests_post_install_launch(task):
+        return False
+    task_text = str(task or "").lower()
+    if not any(token in task_text for token in ("install", "installer", "setup", "설치")):
+        return False
+    chunk_text = " ".join(
+        str(value or "").lower()
+        for value in (
+            chunk.title,
+            chunk.success_hint,
+            chunk.agent_prompt,
+        )
+    )
+    if any(token in chunk_text for token in ("download installer", "download-only", "다운로드")) and not any(
+        token in chunk_text for token in ("run installer", "launch the downloaded", "설치 파일을 실행", "installer finishes")
+    ):
+        return False
+    install_markers = (
+        "run installer",
+        "launch the downloaded",
+        "complete setup",
+        "installer finishes",
+        "is installed",
+        "installed on the machine",
+        "설치 파일을 실행",
+        "설치 완료",
+        "설치가 완료",
+    )
+    return any(marker in chunk_text for marker in install_markers)
 
 
 def _compose_teacher_prompt(*, task: str, config: dict) -> str:
@@ -498,6 +668,7 @@ def cmd_run_session(args: argparse.Namespace) -> int:
     chunk_results: list[dict] = []
     total_chunks = len(teacher_plan.chunks)
     stopped_reason: str | None = None
+    install_completion_reached = False
     chunk_verification_enabled = bool(config.get("chunk_verification_enabled", True))
     previous_chunk_verification_result: dict | None = None
     for chunk_index, chunk in enumerate(teacher_plan.chunks, start=1):
@@ -534,12 +705,25 @@ def cmd_run_session(args: argparse.Namespace) -> int:
             prompt_text = _compose_chunk_prompt(chunk, execution_style=execution_style)
             prompt_text = _append_verified_installer_hint(prompt_text, previous_chunk_verification_result)
             if attempt_index > 0 and final_verification_result is not None:
+                retry_agent_run_label = f"chunk-{chunk_index:03d}.attempt-{attempt_index + 1:02d}"
+                retry_candidate_urls = _request_teacher_retry_link_candidates(
+                    task=args.task,
+                    chunk=chunk,
+                    verification_result=final_verification_result,
+                    teacher_command_template=teacher_command_template,
+                    teacher_workdir=teacher_workdir,
+                    teacher_timeout_s=float(config.get("teacher_split_timeout_s", teacher_timeout_s)),
+                    session_root=session_root,
+                    agent_run_label=retry_agent_run_label,
+                    execution_style=execution_style,
+                )
                 prompt_text = _compose_retry_prompt(
                     chunk=chunk,
                     verification_result=final_verification_result,
                     attempt_index=attempt_index,
                     execution_style=execution_style,
                     prior_verification_result=previous_chunk_verification_result,
+                    candidate_urls=retry_candidate_urls,
                 )
             prompt_result = run_agent_prompt(
                 agent_command=str(config["agent_command"]),
@@ -636,10 +820,15 @@ def cmd_run_session(args: argparse.Namespace) -> int:
         )
         if not chunk_completed:
             break
+        if _should_stop_after_install_completion(args.task, chunk):
+            install_completion_reached = True
+            stopped_reason = "install_completed"
+            break
         previous_chunk_verification_result = final_verification_result
 
     completed_chunks = len(chunk_results)
-    for remaining_index, chunk in enumerate(teacher_plan.chunks[completed_chunks:], start=completed_chunks + 1):
+    remaining_chunks = [] if install_completion_reached else teacher_plan.chunks[completed_chunks:]
+    for remaining_index, chunk in enumerate(remaining_chunks, start=completed_chunks + 1):
         chunk_results.append(
             {
                 "chunk_index": remaining_index,

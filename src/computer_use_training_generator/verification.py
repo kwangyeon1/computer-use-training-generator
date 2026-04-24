@@ -84,6 +84,21 @@ def _normalize_verification_spec(verification: dict[str, object] | None) -> dict
                     normalized["bytes"] = max(0, int(item.get("bytes") or 0))
                 except (TypeError, ValueError):
                     normalized["bytes"] = 0
+                raw_suffixes = item.get("allowed_suffixes")
+                if isinstance(raw_suffixes, list):
+                    allowed_suffixes = []
+                    for value in raw_suffixes:
+                        token = str(value or "").strip().lower()
+                        if not token:
+                            continue
+                        if not token.startswith("."):
+                            token = f".{token}"
+                        if token not in {".exe", ".msi", ".zip", ".alz"}:
+                            continue
+                        if token not in allowed_suffixes:
+                            allowed_suffixes.append(token)
+                    if allowed_suffixes:
+                        normalized["allowed_suffixes"] = allowed_suffixes
             raw_keywords = item.get("keywords")
             if isinstance(raw_keywords, list):
                 keywords = []
@@ -156,6 +171,18 @@ def _expanded_glob_patterns(pattern: str) -> list[str]:
                 relaxed = candidate
         if "installer" in lowered or "setup" in lowered or "windows" in lowered or "win" in lowered:
             _append(_collapse_stars(relaxed))
+    if lowered.endswith((".exe", ".msi")):
+        for token_pattern in (
+            r"(?i)([-_.])win64(?=([-_.])|\.exe$|\.msi$)",
+            r"(?i)([-_.])win32(?=([-_.])|\.exe$|\.msi$)",
+            r"(?i)([-_.])x64(?=([-_.])|\.exe$|\.msi$)",
+            r"(?i)([-_.])x86(?=([-_.])|\.exe$|\.msi$)",
+            r"(?i)([-_.])x86_64(?=([-_.])|\.exe$|\.msi$)",
+            r"(?i)([-_.])amd64(?=([-_.])|\.exe$|\.msi$)",
+        ):
+            candidate = re.sub(token_pattern, r"\1*", raw)
+            if candidate != raw:
+                _append(_collapse_stars(candidate))
     for candidate in list(patterns):
         candidate_lower = candidate.lower()
         if candidate_lower.endswith(".exe"):
@@ -265,6 +292,18 @@ def _expanded_glob_patterns(pattern):
                 relaxed = candidate
         if "installer" in lowered or "setup" in lowered or "windows" in lowered or "win" in lowered:
             _append(re.sub(r"\\*+", "*", relaxed))
+    if lowered.endswith((".exe", ".msi")):
+        for token_pattern in (
+            r"(?i)([-_.])win64(?=([-_.])|\\.exe$|\\.msi$)",
+            r"(?i)([-_.])win32(?=([-_.])|\\.exe$|\\.msi$)",
+            r"(?i)([-_.])x64(?=([-_.])|\\.exe$|\\.msi$)",
+            r"(?i)([-_.])x86(?=([-_.])|\\.exe$|\\.msi$)",
+            r"(?i)([-_.])x86_64(?=([-_.])|\\.exe$|\\.msi$)",
+            r"(?i)([-_.])amd64(?=([-_.])|\\.exe$|\\.msi$)",
+        ):
+            candidate = re.sub(token_pattern, r"\\1*", raw)
+            if candidate != raw:
+                _append(re.sub(r"\\*+", "*", candidate))
     for candidate in list(patterns):
         candidate_lower = candidate.lower()
         if candidate_lower.endswith(".exe"):
@@ -330,8 +369,18 @@ def _validate_json_marker_exe(marker_path, field, keywords):
     entry["suffix"] = candidate.suffix.lower()
     entry["invalid_path"] = _looks_like_invalid_exe_path(str(candidate))
     normalized_keywords = _normalize_keywords(keywords)
+    marker_keywords = payload.get("target_keywords") or []
+    if not isinstance(marker_keywords, list):
+        marker_keywords = []
+    keyword_haystack = " ".join(
+        [
+            str(candidate).lower(),
+            " ".join(str(item).lower() for item in marker_keywords),
+        ]
+    )
     entry["keywords"] = normalized_keywords
-    keyword_hits = [keyword for keyword in normalized_keywords if keyword in str(candidate).lower()]
+    entry["marker_target_keywords"] = marker_keywords
+    keyword_hits = [keyword for keyword in normalized_keywords if keyword in keyword_haystack]
     entry["keyword_hits"] = keyword_hits
     ok = (
         candidate.exists()
@@ -343,7 +392,49 @@ def _validate_json_marker_exe(marker_path, field, keywords):
     return ok, entry
 
 
-def _validate_json_marker_installer(marker_path, field, keywords, min_bytes):
+def _fallback_installer_candidates(keywords, min_bytes, allowed_suffixes):
+    downloads = Path.home() / "Downloads"
+    if not downloads.exists():
+        return []
+    normalized_keywords = _normalize_keywords(keywords)
+    suffixes = []
+    for suffix in allowed_suffixes or (".exe", ".msi"):
+        lowered = str(suffix or "").strip().lower()
+        if not lowered:
+            continue
+        if not lowered.startswith("."):
+            lowered = "." + lowered
+        if lowered not in suffixes:
+            suffixes.append(lowered)
+    if not suffixes:
+        suffixes = [".exe", ".msi"]
+    paths = []
+    for suffix in suffixes:
+        paths.extend(downloads.glob("*" + suffix))
+    candidates = []
+    for path in paths:
+        if not path.is_file():
+            continue
+        try:
+            size = path.stat().st_size
+            mtime = path.stat().st_mtime
+        except OSError:
+            continue
+        if int(size or 0) <= int(min_bytes or 0):
+            continue
+        lowered = str(path).lower()
+        if "portable" in lowered and not any("portable" in keyword for keyword in normalized_keywords):
+            continue
+        keyword_hits = [keyword for keyword in normalized_keywords if keyword in lowered]
+        if normalized_keywords and not keyword_hits:
+            continue
+        installer_name_bonus = 1 if any(token in path.name.lower() for token in ("setup", "installer", "install", "package", "archive")) else 0
+        candidates.append((len(keyword_hits), installer_name_bonus, mtime, path))
+    candidates.sort(reverse=True, key=lambda item: item[:3])
+    return [item[3] for item in candidates]
+
+
+def _validate_json_marker_installer(marker_path, field, keywords, min_bytes, allowed_suffixes):
     expanded_marker = os.path.expanduser(str(marker_path or ""))
     marker = Path(expanded_marker)
     entry = {{
@@ -361,6 +452,9 @@ def _validate_json_marker_installer(marker_path, field, keywords, min_bytes):
         return False, entry
     if not isinstance(payload, dict):
         payload = {{}}
+    marker_keywords = payload.get("target_keywords") or []
+    if not isinstance(marker_keywords, list):
+        marker_keywords = []
     raw_candidate = str(payload.get(field) or "").strip().strip('"')
     entry["value"] = raw_candidate
     if not raw_candidate:
@@ -377,29 +471,49 @@ def _validate_json_marker_installer(marker_path, field, keywords, min_bytes):
         except OSError:
             entry["bytes"] = None
     normalized_keywords = _normalize_keywords(keywords)
-    marker_keywords = payload.get("target_keywords") or []
-    if not isinstance(marker_keywords, list):
-        marker_keywords = []
     source_url = str(payload.get("source_url") or "")
-    keyword_haystack = " ".join(
+    candidate_keyword_haystack = str(candidate).lower()
+    context_haystack = " ".join(
         [
-            str(candidate).lower(),
+            candidate_keyword_haystack,
             source_url.lower(),
             " ".join(str(item).lower() for item in marker_keywords),
         ]
     )
-    keyword_hits = [keyword for keyword in normalized_keywords if keyword in keyword_haystack]
+    keyword_hits = [keyword for keyword in normalized_keywords if keyword in candidate_keyword_haystack]
+    marker_keyword_haystack = " ".join(str(item).lower() for item in marker_keywords)
+    marker_keyword_hits = [keyword for keyword in normalized_keywords if keyword in marker_keyword_haystack]
     entry["keywords"] = normalized_keywords
     entry["marker_target_keywords"] = marker_keywords
     entry["source_url"] = source_url
     entry["keyword_hits"] = keyword_hits
-    allowed_suffixes = {{".exe", ".msi"}}
+    entry["marker_keyword_hits"] = marker_keyword_hits
+    normalized_allowed_suffixes = []
+    for suffix in allowed_suffixes or [".exe", ".msi"]:
+        lowered = str(suffix or "").strip().lower()
+        if not lowered:
+            continue
+        if not lowered.startswith("."):
+            lowered = "." + lowered
+        if lowered not in normalized_allowed_suffixes:
+            normalized_allowed_suffixes.append(lowered)
+    if not normalized_allowed_suffixes:
+        normalized_allowed_suffixes = [".exe", ".msi"]
+    entry["allowed_suffixes"] = normalized_allowed_suffixes
+    # The marker can be stale or polluted, so target_keywords/source_url are only
+    # evidence. The completed artifact path itself must match the verifier's task
+    # keywords when keywords are provided.
+    keyword_ok = not normalized_keywords or bool(keyword_hits)
+    if normalized_keywords and not keyword_hits:
+        entry["error"] = "installer_path_keyword_mismatch"
+    portable_ok = "portable" not in context_haystack or any("portable" in keyword for keyword in normalized_keywords)
     ok = (
         candidate.exists()
         and candidate.is_file()
-        and candidate.suffix.lower() in allowed_suffixes
+        and candidate.suffix.lower() in normalized_allowed_suffixes
         and (entry["bytes"] or 0) > int(min_bytes or 0)
-        and (not normalized_keywords or bool(keyword_hits))
+        and keyword_ok
+        and portable_ok
     )
     return ok, entry
 
@@ -456,7 +570,8 @@ for check in CHECKS:
         field = str(check.get("field") or "installer_path")
         keywords = check.get("keywords") or []
         min_bytes = int(check.get("bytes") or 0)
-        ok, marker_entry = _validate_json_marker_installer(path, field, keywords, min_bytes)
+        allowed_suffixes = check.get("allowed_suffixes") or []
+        ok, marker_entry = _validate_json_marker_installer(path, field, keywords, min_bytes, allowed_suffixes)
         entry.update(marker_entry)
     else:
         entry["error"] = "unsupported_check_kind"

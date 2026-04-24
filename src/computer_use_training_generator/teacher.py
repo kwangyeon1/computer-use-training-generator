@@ -49,8 +49,8 @@ Requirements:
 - Each chunk prompt should describe what the agent must accomplish with executable Python on the target machine.
 - Do not rely on a human to manually click, type, confirm dialogs, or inspect pages outside the Python automation flow.
 - Use as many chunks as needed, but keep them compact and stage-focused.
-- If the original answer contains official URLs or important warnings, keep them in the relevant chunk prompt.
-- For software download/install chunks, include at least one exact official vendor or official release URL directly in `agent_prompt` whenever you know one from the task, teacher answer, or your own planning. Do not leave the agent to infer the base domain from product names alone.
+- If the user's original task explicitly contains URLs or important warnings, keep them in the relevant chunk prompt.
+- For software download/install chunks, do not invent or promote exact vendor URLs that were not present in the user's original task. If no user-provided URL exists, instruct the agent to use a short target-keyword search or continue from the visible browser page instead of hard-coding a guessed domain.
 - Each chunk must include a read-only verification plan.
 - Verification must use only the allowed check kinds: `path_exists`, `file_exists_glob`, `file_size_gt`, `process_exists`, `json_marker_valid_installer`, `json_marker_valid_exe`.
 - All verification checks are combined with logical AND.
@@ -65,8 +65,8 @@ Requirements:
 - If the task is about a Windows desktop or Windows software install, use Windows-oriented chunk prompts and Windows-friendly verifier checks.
 - For Windows software installation tasks, prefer the official `.exe` or `.msi` installer build, not `.zip`, portable, or archive downloads unless the task explicitly asks for those formats.
 - For Windows installer download chunks, state explicitly in `agent_prompt` that the agent must download the installer `.exe` or `.msi` and must avoid `.zip` or archive builds.
-- For Windows installer download chunks, prefer deterministic Python-first flows: direct official URL discovery, Python download to `Downloads`, file-size/path verification, and Python-launched installer execution before browser-click-heavy flows.
-- For Windows installer download chunks, prefer prompts that name the exact official landing page or release page URL to fetch first, then instruct the agent to resolve relative or absolute `.exe` or `.msi` links from that page.
+- For Windows installer download chunks, prefer deterministic Python-first flows where there is grounded evidence: user-provided URL, current visible page, search result page, or a verified link discovered by the agent. Avoid guessed exact domains in the teacher chunk.
+- For Windows installer download chunks, name exact landing/release URLs only when the user supplied them in the original task; otherwise tell the agent to search with target keywords and platform hints.
 - For GUI-first install/download tasks, do not emit a standalone browser-navigation chunk whose verifier only checks a generic state such as `~/Downloads` existing. If opening an official page is only preparation for a download, fold that navigation into the download chunk and verify the actual downloaded installer artifact instead.
 - Only fall back to browser GUI navigation when a direct official installer URL cannot be determined from the teacher answer or current task context.
 - For general GUI operation tasks after installation, continue from the current desktop/app state instead of restarting setup or redownloading software unless the task explicitly asks for it.
@@ -80,6 +80,32 @@ Overall task:
 
 Teacher answer:
 {teacher_text}
+"""
+
+_REPLAN_LINK_CANDIDATE_PROMPT_TEMPLATE = """Return strict JSON only.
+
+The computer-use agent failed a software download/navigation chunk and needs candidate landing-page URLs for the next retry.
+
+Task:
+{task}
+
+Chunk title:
+{chunk_title}
+
+Chunk prompt:
+{chunk_prompt}
+
+Failure/verifier context:
+{failure_context}
+
+Requirements:
+- Output exactly one JSON object with this shape: {{"candidate_urls":["https://..."],"notes":"short optional reason"}}
+- Return 1 to 5 absolute http(s) page URLs, not prose.
+- Prefer vendor/product/download/release landing pages that are relevant to the exact target product keywords in the task.
+- Do not return search-engine result URLs, app-store URLs, YouTube, blogs, tutorials, reviews, forums, social media, or unrelated software pages.
+- It is acceptable to include non-official but clearly product-specific download pages when the official page failed.
+- Do not invent versioned installer artifact filenames. Return page URLs that the agent can open and inspect.
+- If no relevant page URL is known, return {{"candidate_urls":[],"notes":"no relevant URL found"}}.
 """
 
 _GENERIC_INSTALLER_TOKENS = {
@@ -231,7 +257,18 @@ _GENERIC_STOP_TOKENS = {
 _GENERIC_KOREAN_STOP_TOKENS = {
     "설치",
     "설치해줘",
+    "설치해",
     "다운로드",
+    "다운로드해",
+    "다운로드해줘",
+    "다운받아",
+    "다운받아줘",
+    "내려받아",
+    "내려받아줘",
+    "받아",
+    "받아줘",
+    "해줘",
+    "해주세요",
     "프로그램",
     "프로그램을",
     "버전",
@@ -424,7 +461,7 @@ def _score_official_page_candidate(task: str, candidate: dict[str, str]) -> int:
     labels = [label for label in host.split(".") if label]
     lead_label = labels[0] if labels else ""
     combined = "\n".join((title, snippet, url, decoded_path)).lower()
-    keywords = _target_installer_keywords(task, title, snippet, limit=3)
+    keywords = _target_installer_keywords(task, limit=3)
 
     score = 0
     if any(token in combined for token in ("official", "공식")):
@@ -473,12 +510,25 @@ def _score_official_page_candidate(task: str, candidate: dict[str, str]) -> int:
         score += 6
     if lead_label and len(lead_label) <= 12:
         score += 6
+    keyword_hits = 0
     for keyword in keywords:
         lowered_keyword = keyword.lower()
+        matched = False
         if lowered_keyword in combined:
             score += 8
+            matched = True
         if lowered_keyword in host:
             score += 6
+            matched = True
+        if matched:
+            keyword_hits += 1
+    if keywords:
+        if keyword_hits == 0:
+            score -= 240
+        elif keyword_hits == 1:
+            score += 18
+        else:
+            score += 36
     return score
 
 
@@ -558,10 +608,14 @@ def _discover_official_page_urls(task: str, *, limit: int = 2) -> list[str]:
     keywords = _target_installer_keywords(task, limit=3)
     if not keywords:
         return []
-    if any(re.search(r"[가-힣]", keyword) for keyword in keywords):
-        query = " ".join([*keywords, "공식", "다운로드"])
-    else:
-        query = " ".join([*keywords, "official", "windows", "download"])
+    query_terms: list[str] = []
+    for token in [*keywords, *_task_search_platform_hints(task, limit=2)]:
+        cleaned = str(token or "").strip()
+        if cleaned and cleaned not in query_terms:
+            query_terms.append(cleaned)
+    if not any(re.search(r"[가-힣]", keyword) for keyword in query_terms) and "windows" not in query_terms:
+        query_terms.append("windows")
+    query = " ".join(query_terms[:4])
     search_url = f"https://www.bing.com/search?q={urllib.parse.quote(query)}"
     user_agents = (
         "Mozilla/5.0",
@@ -653,15 +707,35 @@ def _task_explicitly_requests_store(task: str) -> bool:
 
 def _looks_like_store_detour_prompt(agent_prompt: str) -> bool:
     lowered = str(agent_prompt or "").lower()
+    negative_markers = (
+        "do not use microsoft store",
+        "do not use the microsoft store",
+        "do not route through microsoft store",
+        "do not route through the microsoft store",
+        "do not substitute a third-party source or microsoft store",
+        "avoid microsoft store",
+        "instead of microsoft store",
+        "microsoft store 대신",
+        "스토어로 가지 마세요",
+        "스토어를 사용하지 마세요",
+    )
+    if any(marker in lowered for marker in negative_markers):
+        return False
+    if any(token in lowered for token in ("ms-windows-store://", "apps.microsoft.com")):
+        return True
     return any(
         token in lowered
         for token in (
-            "ms-windows-store://",
-            "apps.microsoft.com",
-            "microsoft store",
-            "windows store",
-            "app store",
-            "스토어",
+            "open the microsoft store",
+            "use microsoft store",
+            "install from microsoft store",
+            "microsoft store listing",
+            "windows store listing",
+            "open store listing",
+            "open the store listing",
+            "앱 스토어",
+            "스토어에서 설치",
+            "스토어 목록",
         )
     )
 
@@ -681,9 +755,51 @@ def _fallback_command_result(*, prompt: str, command_template: str, cwd: str | N
     )
 
 
+def _product_phrase_keyword_candidates(part: str) -> list[str]:
+    text = str(part or "")
+    task_prefix = re.split(
+        r"(?:설치|다운로드|실행|프로그램|install|download|launch|run)\b",
+        text,
+        maxsplit=1,
+        flags=re.IGNORECASE,
+    )[0]
+    raw_tokens = re.findall(r"[A-Za-z0-9가-힣]+", task_prefix)
+    if len(raw_tokens) < 2:
+        return []
+    has_product_case = any(
+        (token.isupper() and len(token) <= 5)
+        or (any(ch.isupper() for ch in token) and any(ch.islower() for ch in token))
+        for token in raw_tokens
+    )
+    has_connector = any(token.lower() in {"for", "of", "with", "and"} for token in raw_tokens)
+    if not (has_product_case or has_connector):
+        return []
+    result: list[str] = []
+    for raw in raw_tokens:
+        lowered = _strip_korean_particle(raw.lower())
+        if not lowered or lowered in {"for", "of", "with", "and", "the"}:
+            continue
+        if lowered in _GENERIC_INSTALLER_TOKENS or lowered in _GENERIC_ACTION_TOKENS:
+            continue
+        if lowered in _GENERIC_STOP_TOKENS and lowered != "browser":
+            continue
+        if lowered in _GENERIC_KOREAN_STOP_TOKENS or lowered.isdigit():
+            continue
+        if re.search(r"[가-힣]", lowered) is None and len(lowered) <= 2 and not raw.isupper():
+            continue
+        if lowered not in result:
+            result.append(lowered)
+    return result
+
+
 def _target_installer_keywords(*parts: str, limit: int = 2) -> list[str]:
     tokens: list[str] = []
     for part in parts:
+        for token in _product_phrase_keyword_candidates(str(part or "")):
+            if token not in tokens:
+                tokens.append(token)
+            if len(tokens) >= limit:
+                return tokens
         for token in re.findall(r"[a-z0-9가-힣]+", str(part or "").lower()):
             token = _strip_korean_particle(token)
             if (
@@ -704,8 +820,30 @@ def _target_installer_keywords(*parts: str, limit: int = 2) -> list[str]:
     return tokens
 
 
+def _task_search_platform_hints(*parts: str, limit: int = 2) -> list[str]:
+    raw_text = " ".join(str(part or "") for part in parts).lower()
+    compact_text = re.sub(r"\s+", "", raw_text)
+    hints: list[str] = []
+
+    def _append_hint(value: str) -> None:
+        cleaned = str(value or "").strip().lower()
+        if cleaned and cleaned not in hints:
+            hints.append(cleaned)
+
+    if any(token in compact_text for token in ("pc버전", "pc용", "피시버전", "피씨버전")) or re.search(r"\bpc\b", raw_text):
+        _append_hint("pc")
+    if "windows" in raw_text or "윈도우" in raw_text:
+        _append_hint("windows")
+    return hints[:limit]
+
+
 def _matching_installer_hint(*, source_task: str, title: str, agent_prompt: str, action: str) -> str:
-    keywords = _target_installer_keywords(source_task, title, agent_prompt)
+    keywords = _target_installer_keywords(source_task, limit=3) or _target_installer_keywords(
+        source_task,
+        title,
+        agent_prompt,
+        limit=3,
+    )
     if keywords:
         joined = ", ".join(f"`{keyword}`" for keyword in keywords)
         return (
@@ -716,15 +854,84 @@ def _matching_installer_hint(*, source_task: str, title: str, agent_prompt: str,
 
 
 def _official_source_hint(*parts: str) -> str:
-    keywords = _target_installer_keywords(*parts, limit=3)
+    source_task = str(parts[0] if parts else "")
+    keywords = _target_installer_keywords(source_task, limit=3) or _target_installer_keywords(*parts, limit=3)
     if not keywords:
         return ""
     joined = ", ".join(f"`{keyword}`" for keyword in keywords)
     return (
-        f"공식 source는 작업과 일치하는 vendor site, official download page, official docs, official release page만 사용하세요. "
-        f"가능하면 {joined} 같은 대상 앱 키워드가 포함된 공식 Windows installer `.exe` 또는 `.msi`를 우선 찾으세요. "
-        "한 공식 페이지에서 raw installer 링크를 찾지 못해도 하드코딩된 버전 번호나 추측한 파일명으로 점프하지 말고, "
-        "다른 공식 페이지나 공식 release 페이지 HTML에서 최신 `.exe` 또는 `.msi` asset을 다시 추출하세요."
+        f"작업과 일치하는 vendor, product, download 페이지를 우선 사용하세요. "
+        f"가능하면 {joined} 같은 대상 앱 키워드가 포함된 Windows installer `.exe` 또는 `.msi`를 우선 찾으세요. "
+        "한 페이지에서 raw installer 링크를 찾지 못해도 하드코딩된 버전 번호나 추측한 파일명으로 점프하지 말고, "
+        "다른 관련 페이지 HTML에서 최신 `.exe` 또는 `.msi` asset을 다시 추출하세요."
+    )
+
+
+def _extract_urls_from_text(text: str) -> list[str]:
+    urls: list[str] = []
+    for match in re.findall(r"https?://[^\s<>()\[\]{}\"'`]+", str(text or "")):
+        candidate = str(match or "").strip().rstrip(".,);]>}")
+        if candidate and candidate not in urls:
+            urls.append(candidate)
+    return urls
+
+
+def _remove_non_user_urls_from_prompt(source_task: str, text: str) -> str:
+    user_urls = set(_extract_urls_from_text(source_task))
+    if user_urls or _task_explicitly_requests_store(source_task):
+        return str(text or "")
+    cleaned = str(text or "")
+    for url in _extract_urls_from_text(cleaned):
+        cleaned = cleaned.replace(f"`{url}`", "a relevant product/download page")
+        cleaned = cleaned.replace(url, "a relevant product/download page")
+    return cleaned
+
+
+def _exact_official_page_hint(task: str, *parts: str, limit: int = 2) -> str:
+    task_urls = _extract_urls_from_text(task)
+    if not task_urls:
+        return ""
+    discovered: list[str] = []
+    for url in task_urls:
+        if url not in discovered:
+            discovered.append(url)
+    selected = _sanitize_discovered_official_urls(task, discovered, limit=limit)
+    if not selected:
+        return ""
+    lines = "\n".join(f"- {url}" for url in selected)
+    return (
+        "Use these exact page URLs first before any search engine result or inferred domain:\n"
+        f"{lines}\n"
+        "Prefer the first URL if it already looks like the primary vendor or product landing page."
+    )
+
+
+def _source_allows_official_archive_package(*parts: str) -> bool:
+    combined = "\n".join(str(part or "") for part in parts)
+    lowered = combined.lower()
+    if any(url.lower().endswith((".zip", ".alz")) for url in _extract_urls_from_text(combined)):
+        return True
+    explicit_markers = (
+        "if the downloaded package is a `.zip`",
+        "if the downloaded package is a .zip",
+        "if the package is a `.zip`",
+        "if the package is a .zip",
+        "page only provides an archive package",
+        "only provides an archive package",
+        "not as a direct standalone `.exe` link",
+        "not as a direct standalone .exe link",
+        "downloadable package, not as a direct standalone `.exe` link",
+        "downloadable package, not as a direct standalone .exe link",
+        "contained installer executable",
+        "contained installer on the target machine",
+        "locate the installer executable inside the extracted folder",
+    )
+    if any(marker in lowered for marker in explicit_markers):
+        return True
+    return (
+        any(token in lowered for token in ("zip", "alz", "archive package", "installer package"))
+        and "extract" in lowered
+        and any(token in lowered for token in ("installer", "setup", "contained"))
     )
 
 
@@ -800,7 +1007,7 @@ def _normalize_windows_installer_verification(
     if not isinstance(verification, dict):
         return verification
     combined = f"{title}\n{agent_prompt}".lower()
-    if "windows" not in combined or not any(ext in combined for ext in (".exe", ".msi")):
+    if "windows" not in combined or not any(ext in combined for ext in (".exe", ".msi", ".zip", ".alz")):
         return verification
     if not any(keyword in combined for keyword in ("installer", "install", "설치", "download", "다운로드")):
         return verification
@@ -818,6 +1025,12 @@ def _normalize_windows_installer_verification(
             continue
         updated = dict(item)
         kind = str(updated.get("kind") or "").strip()
+        if kind == "path_exists":
+            path = str(updated.get("path") or "").strip()
+            if path and any(token in path for token in ("*", "?", "[")):
+                updated = {"kind": "file_exists_glob", "pattern": path}
+                kind = "file_exists_glob"
+                changed = True
         if kind == "file_exists_glob":
             pattern = str(updated.get("pattern") or "").strip()
             simplified = _simplify_windows_installer_glob(pattern)
@@ -865,6 +1078,55 @@ def _verification_has_kind(verification: dict | None, *kinds: str) -> bool:
         if not isinstance(item, dict):
             continue
         if str(item.get("kind") or "").strip() in expected:
+            return True
+    return False
+
+
+def _verification_has_path_exists(verification: dict | None, path: str) -> bool:
+    checks = (verification or {}).get("checks")
+    if not isinstance(checks, list):
+        return False
+    expected_path = str(path or "").strip()
+    if not expected_path:
+        return False
+    for item in checks:
+        if not isinstance(item, dict):
+            continue
+        if str(item.get("kind") or "").strip() != "path_exists":
+            continue
+        if str(item.get("path") or "").strip() == expected_path:
+            return True
+    return False
+
+
+def _verification_has_json_marker_check(
+    verification: dict | None,
+    *,
+    kind: str,
+    marker_path: str,
+    field: str,
+) -> bool:
+    checks = (verification or {}).get("checks")
+    if not isinstance(checks, list):
+        return False
+    expected_kind = str(kind or "").strip()
+    expected_path = str(marker_path or "").strip()
+    expected_field = str(field or "").strip()
+    if not expected_kind or not expected_path or not expected_field:
+        return False
+    for item in checks:
+        if not isinstance(item, dict):
+            continue
+        if str(item.get("kind") or "").strip() != expected_kind:
+            continue
+        path = str(item.get("path") or "").strip()
+        if not path.lower().endswith(".json"):
+            continue
+        actual_field = str(
+            item.get("field")
+            or ("installed_exe" if expected_kind == "json_marker_valid_exe" else "installer_path")
+        ).strip()
+        if path == expected_path and actual_field == expected_field:
             return True
     return False
 
@@ -919,7 +1181,10 @@ def _looks_like_download_chunk(title: str, agent_prompt: str) -> bool:
         "installer `.exe` only",
         "installer `.msi` only",
     )
-    return any(ext in combined for ext in (".exe", ".msi")) and any(
+    has_artifact_hint = any(ext in combined for ext in (".exe", ".msi", ".zip", ".alz")) or any(
+        token in combined for token in ("archive package", "installer package", "contained installer", "extract it")
+    )
+    return has_artifact_hint and any(
         token in combined for token in download_markers
     )
 
@@ -949,7 +1214,7 @@ def _looks_like_navigation_only_chunk(chunk: TeacherTaskChunk) -> bool:
 
 def _looks_like_install_execution_chunk(title: str, agent_prompt: str) -> bool:
     combined = f"{title}\n{agent_prompt}".lower()
-    if any(token in combined for token in ("login screen", "로그인 화면", "launch marker", "start menu", "foreground")):
+    if any(token in combined for token in ("login screen", "로그인 화면", "launch marker", "foreground")):
         return False
     download_stage_markers = (
         "download the official windows installer",
@@ -1001,6 +1266,9 @@ def _looks_like_install_execution_chunk(title: str, agent_prompt: str) -> bool:
         "complete the setup",
         "finish install",
         "finish setup",
+        "proceed through the installer",
+        "after installation finishes",
+        "installation finishes",
         "drive the windows installer",
         "drive the installer",
         "설치 파일 실행",
@@ -1013,7 +1281,19 @@ def _looks_like_install_execution_chunk(title: str, agent_prompt: str) -> bool:
     )
     if any(marker in combined for marker in download_stage_markers) and not any(marker in combined for marker in strong_install_markers):
         return False
-    installer_artifact_markers = (".exe", ".msi", " msi", "msi ", " installer")
+    installer_artifact_markers = (
+        ".exe",
+        ".msi",
+        ".zip",
+        ".alz",
+        " msi",
+        "msi ",
+        " installer",
+        "installer executable",
+        "setup executable",
+        "archive package",
+        "installer package",
+    )
     return any(ext in combined for ext in installer_artifact_markers) and any(marker in combined for marker in install_run_markers)
 
 
@@ -1145,23 +1425,26 @@ def _normalize_windows_installer_agent_prompt(
     source_task: str,
     title: str,
     agent_prompt: str,
+    source_text: str | None = None,
     execution_style: str = "python_first",
 ) -> str:
     raw = str(agent_prompt or "").strip()
     if not raw:
         return raw
+    raw = _remove_non_user_urls_from_prompt(source_task, raw)
     normalized_style = _normalize_execution_style(execution_style)
-    combined = f"{title}\n{raw}".lower()
     normalized = raw
+    archive_allowed = _source_allows_official_archive_package(source_task, title, raw, source_text or "")
     common_python_hint = (
         "이 chunk는 실행 가능한 Python 코드만으로 수행하세요. "
         "다운로드는 curl, wget, powershell, http.server 같은 외부 도구 대신 Python HTTP와 파일 I/O를 사용하세요. "
+        "검색이 필요하면 자연어 문장 전체를 검색창에 넣지 말고, 대상 앱 핵심 키워드 2~5개와 필요한 플랫폼 힌트(`pc`, `windows`) 정도만 짧게 사용하세요. "
         "Windows 사용자 폴더 경로는 %USERPROFILE% 문자열을 그대로 쓰지 말고 os.environ, os.path.expandvars, Path.home() 등으로 실제 경로를 해석하세요. "
-        "chunk prompt 안에 공식 vendor URL이 이미 있으면 그 exact URL부터 먼저 fetch하고, 비슷해 보이는 다른 host나 guessed latest path로 바꾸지 마세요. "
-        "공식 landing page에 raw installer 링크가 바로 없으면 같은 스크립트 안에서 다른 공식 페이지나 공식 release 페이지도 확인하세요. "
-        "공식 HTML에서 실제로 확인하지 않은 `/files/latest`, `/download/latest` 같은 guessed artifact 디렉터리를 HTML page처럼 바로 열지 마세요. "
-        "공식 HTML의 relative href/src 링크는 urllib.parse.urljoin 으로 base page에 대해 절대 URL로 변환해서 검사하세요. "
-        "installer 링크가 버전 숫자를 포함한다고 가정하지 말고, relative 또는 absolute official `.exe` 또는 `.msi` 링크를 넓게 수집한 뒤 HTTP 요청으로 검증하세요. "
+        "chunk prompt 안에 이미 URL이 있으면 그 exact URL부터 먼저 fetch하고, 비슷해 보이는 다른 host나 guessed latest path로 바꾸지 마세요. "
+        "landing page에 raw installer 링크가 바로 없으면 같은 스크립트 안에서 다른 관련 페이지도 확인하세요. "
+        "HTML에서 실제로 확인하지 않은 `/files/latest`, `/download/latest` 같은 guessed artifact 디렉터리를 HTML page처럼 바로 열지 마세요. "
+        "HTML의 relative href/src 링크는 urllib.parse.urljoin 으로 base page에 대해 절대 URL로 변환해서 검사하세요. "
+        "installer 링크가 버전 숫자를 포함한다고 가정하지 말고, relative 또는 absolute `.exe` 또는 `.msi` 링크를 넓게 수집한 뒤 HTTP 요청으로 검증하세요. "
         "HTML에서는 href만 보지 말고 absolute https .exe URL 후보와 .msi URL 후보도 찾고, 선택한 URL은 실제 HTTP 요청으로 검증하세요. "
         "다운로드나 설치가 실패하면 예외를 발생시키거나 non-zero로 종료하세요."
     )
@@ -1174,23 +1457,38 @@ def _normalize_windows_installer_agent_prompt(
         "설치 후에는 `%LOCALAPPDATA%`, `%ProgramFiles%`, `%ProgramFiles(x86)%` 아래의 일반적인 설치 경로에서 대상 앱 `.exe`를 찾고, 찾으면 즉시 실행한 뒤 프로세스가 뜰 때까지 확인하세요. "
         "silent install이 분명히 실패하거나 timeout이 나면 같은 silent command를 반복하지 말고 Python GUI 자동화로 현재 설치 창을 진행하세요."
     )
-    gui_download_hint = (
-        "이 chunk는 실행 가능한 Python 코드만으로 수행하세요. "
-        "현재 스크린샷에 브라우저, 검색 결과, 공식 다운로드 페이지, 다운로드 버튼, 다운로드 진행 UI가 보이면 그 보이는 UI를 Python GUI 자동화로 이어서 사용하세요. "
-        "현재 화면에 근거가 없을 때만 새 페이지를 여세요. "
-        "근거 있는 visible browser/download UI가 이미 있으면 그 chunk 안에서 새 urllib/requests HTML scraping이나 fresh direct fetch로 갈아타지 말고, 먼저 그 UI를 끝까지 진행하세요. "
-        "보이는 download/install control 이 있으면 현재 스크린샷을 보고 페이지 본문 영역의 좌표나 키보드 이동을 고르세요. direct installer URL을 추측해서 바로 받으려 하지 마세요. "
-        "같은 페이지를 다시 시도할 때는 같은 탭/페이지를 유지하고, 이전에 실패한 지점과 다른 page-content 후보를 몇 개 순차적으로 시도하세요. "
-        "브라우저 주소창, 탭 줄, 북마크 바, 빈 여백은 download 후보로 취급하지 마세요. "
-        "여전히 공식 vendor source를 우선하고 `.zip`이나 archive가 아니라 Windows installer `.exe` 또는 `.msi`를 선택하세요."
-    )
+    if archive_allowed:
+        gui_download_hint = (
+            "이 chunk는 실행 가능한 Python 코드만으로 수행하세요. "
+            "현재 스크린샷에 브라우저, 검색 결과, 다운로드 페이지, 다운로드 버튼, 다운로드 진행 UI가 보이면 그 보이는 UI를 Python GUI 자동화로 이어서 사용하세요. "
+            "현재 화면에 근거가 없을 때만 새 페이지를 여세요. "
+            "검색이 필요하면 자연어 문장 전체를 검색창에 넣지 말고, 대상 앱 핵심 키워드 2~5개와 필요한 플랫폼 힌트(`pc`, `windows`) 정도만 짧게 사용하세요. "
+            "근거 있는 visible browser/download UI가 이미 있으면 그 chunk 안에서 새 urllib/requests HTML scraping이나 fresh direct fetch로 갈아타지 말고, 먼저 그 UI를 끝까지 진행하세요. "
+            "보이는 download/install control 이 있으면 현재 스크린샷을 보고 페이지 본문 영역의 좌표나 키보드 이동을 고르세요. direct installer URL을 추측해서 바로 받으려 하지 마세요. "
+            "같은 페이지를 다시 시도할 때는 같은 탭/페이지를 유지하고, 이전에 실패한 지점과 다른 page-content 후보를 몇 개 순차적으로 시도하세요. "
+            "브라우저 주소창, 탭 줄, 북마크 바, 빈 여백은 download 후보로 취급하지 마세요. "
+            "작업과 관련된 vendor, product, download 페이지를 우선하세요. `.exe` 또는 `.msi`가 있으면 그것을 우선하고, 페이지가 설치용 `.zip` 또는 `.alz` 패키지만 제공하면 그 archive를 사용해도 됩니다."
+        )
+    else:
+        gui_download_hint = (
+            "이 chunk는 실행 가능한 Python 코드만으로 수행하세요. "
+            "현재 스크린샷에 브라우저, 검색 결과, 다운로드 페이지, 다운로드 버튼, 다운로드 진행 UI가 보이면 그 보이는 UI를 Python GUI 자동화로 이어서 사용하세요. "
+            "현재 화면에 근거가 없을 때만 새 페이지를 여세요. "
+            "검색이 필요하면 자연어 문장 전체를 검색창에 넣지 말고, 대상 앱 핵심 키워드 2~5개와 필요한 플랫폼 힌트(`pc`, `windows`) 정도만 짧게 사용하세요. "
+            "근거 있는 visible browser/download UI가 이미 있으면 그 chunk 안에서 새 urllib/requests HTML scraping이나 fresh direct fetch로 갈아타지 말고, 먼저 그 UI를 끝까지 진행하세요. "
+            "보이는 download/install control 이 있으면 현재 스크린샷을 보고 페이지 본문 영역의 좌표나 키보드 이동을 고르세요. direct installer URL을 추측해서 바로 받으려 하지 마세요. "
+            "같은 페이지를 다시 시도할 때는 같은 탭/페이지를 유지하고, 이전에 실패한 지점과 다른 page-content 후보를 몇 개 순차적으로 시도하세요. "
+            "브라우저 주소창, 탭 줄, 북마크 바, 빈 여백은 download 후보로 취급하지 마세요. "
+            "작업과 관련된 vendor, product, download 페이지를 우선하세요. `.exe` 또는 `.msi`가 있으면 그것을 우선하고, 페이지가 설치용 `.zip` 또는 `.alz` 패키지만 제공하면 그 archive를 사용해도 됩니다."
+        )
     gui_install_hint = (
         "이 install chunk는 실행 가능한 Python 코드만으로 수행하세요. "
         "현재 스크린샷이나 데스크톱 상태에 installer wizard, UAC prompt, license dialog, destination dialog, completion dialog가 보이면 "
         "그 visible installer UI를 Python GUI 자동화로 먼저 진행하세요. 현재 화면에 설치 UI가 없을 때만 이미 다운로드된 installer `.exe` 또는 `.msi`를 다시 실행하세요. "
         "작업 도중 새 다운로드 helper나 URL 탐색 로직을 추가하지 마세요."
     )
-    source_hint = _official_source_hint(source_task, title, raw)
+    source_hint = _official_source_hint(source_task, title, raw, source_text or "")
+    exact_page_hint = _exact_official_page_hint(source_task, raw, source_text or "")
     raw_install_chunk = _looks_like_install_execution_chunk(title, raw)
     raw_download_chunk = _looks_like_download_chunk(title, raw)
     if raw_install_chunk:
@@ -1201,22 +1499,48 @@ def _normalize_windows_installer_agent_prompt(
         preferred_install_hint = gui_install_hint if normalized_style == "gui_first" else install_python_hint
         if preferred_install_hint not in normalized:
             normalized = f"{preferred_install_hint}\n\n{normalized}"
+        if archive_allowed:
+            archive_install_hint = (
+                "관련 source가 설치용 `.zip` 또는 `.alz` 패키지만 제공한 경우에는 먼저 그 archive를 Downloads 안에서 추출하고, "
+                "추출된 폴더 안의 실제 installer `.exe` 또는 `.msi`를 찾아 그 설치 UI를 진행하세요."
+            )
+            if archive_install_hint not in normalized:
+                normalized = f"{archive_install_hint}\n\n{normalized}"
         if install_hint not in normalized:
             normalized = f"{install_hint}\n\n{normalized}"
-        return normalized
+        if exact_page_hint and exact_page_hint not in normalized:
+            normalized = f"{normalized}\n\n{exact_page_hint}"
+        return _remove_non_user_urls_from_prompt(source_task, normalized)
     if raw_download_chunk:
+        if archive_allowed:
+            normalized = normalized.replace(
+                "Do not use `.zip`, portable, or archive downloads.",
+                "Prefer `.exe` or `.msi` when the current page provides them. If the page for this task only exposes a `.zip` or `.alz` installer package, download that archive instead of switching to another host.",
+            )
+            normalized = normalized.replace(
+                "여전히 공식 vendor source를 우선하고 `.zip`이나 archive가 아니라 Windows installer `.exe` 또는 `.msi`를 선택하세요.",
+                "관련 vendor, product, download 페이지를 우선하세요. `.exe` 또는 `.msi`가 있으면 그것을 우선하고, 페이지가 설치용 `.zip` 또는 `.alz` 패키지만 제공하면 그 archive를 사용해도 됩니다.",
+            )
         reuse_hint = (
             "이미 Downloads 폴더에 사용할 수 있는 대상 앱의 Windows installer `.exe` 또는 `.msi`가 있으면 새로 받지 말고 그 파일을 그대로 사용해도 됩니다.\n"
             + _matching_installer_hint(source_task=source_task, title=title, agent_prompt=raw, action="사용")
+        )
+        context_hint = (
+            "If you confirm or obtain a valid installer/archive for this task, write the soft continuity file "
+            "`~/Downloads/computer-use-agent-context.json` with `installer_path`, `source_url`, and `target_keywords` so verification and later chunks can continue from the exact artifact."
         )
         preferred_download_hint = gui_download_hint if normalized_style == "gui_first" else common_python_hint
         if preferred_download_hint not in normalized:
             normalized = f"{preferred_download_hint}\n\n{normalized}"
         if source_hint and source_hint not in normalized:
             normalized = f"{normalized}\n\n{source_hint}"
+        if exact_page_hint and exact_page_hint not in normalized:
+            normalized = f"{normalized}\n\n{exact_page_hint}"
         if reuse_hint not in normalized:
             normalized = f"{normalized}\n\n{reuse_hint}"
-    return normalized
+        if normalized_style == "gui_first" and context_hint not in normalized:
+            normalized = f"{normalized}\n\n{context_hint}"
+    return _remove_non_user_urls_from_prompt(source_task, normalized)
 
 
 def _normalize_general_gui_agent_prompt(
@@ -1257,8 +1581,12 @@ def _local_install_chunks(
 ) -> list[TeacherTaskChunk]:
     normalized_style = _normalize_execution_style(execution_style)
     keyword = (_target_installer_keywords(task, limit=1) or ["targetapp"])[0]
-    discovered_official_urls = _discover_official_page_urls(task, limit=2)
-    discovered_official_urls = _sanitize_discovered_official_urls(task, discovered_official_urls, limit=2)
+    discovered_official_urls = []
+    if _extract_urls_from_text(task):
+        discovered_official_urls = _discover_official_page_urls(task, limit=2)
+    discovered_official_urls = [
+        url for url in discovered_official_urls if _looks_like_plausible_official_page_url(url)
+    ]
     if not _task_explicitly_requests_store(task):
         non_store_urls = [url for url in discovered_official_urls if "apps.microsoft.com" not in str(url).lower()]
         if non_store_urls:
@@ -1302,6 +1630,10 @@ def _local_install_chunks(
         launch_marker_path = f"~/Downloads/computer-use-agent/{staging_subdir}/launch-success.json"
         context_path = f"~/Downloads/computer-use-agent/{staging_subdir}/computer-use-agent-context.json"
     likely_install_paths = _likely_install_path_hint(keyword)
+    archive_install_hint = (
+        f"If the official downloaded installer package for this task is `.zip` or `.alz`, extract it inside `{downloads_root}` first, "
+        "then find the contained installer `.exe` or `.msi` and continue from that extracted installer."
+    )
     download_title = f"Download {keyword} installer"
     install_title = f"Install {keyword}"
     launch_title = f"Launch {keyword}"
@@ -1313,6 +1645,7 @@ def _local_install_chunks(
                 "field": "installer_path",
                 "keywords": target_keywords,
                 "bytes": 1000000,
+                "allowed_suffixes": [".exe", ".msi", ".zip", ".alz"],
             }
         ]
     else:
@@ -1322,13 +1655,14 @@ def _local_install_chunks(
         ]
     if normalized_style == "gui_first":
         download_prompt = (
-            f"Use executable Python on the Windows machine to obtain the official Windows installer `.exe` or `.msi` for the target app from this task: {task}. "
-            f"First inspect the current screenshot and desktop state. If a browser, search results page, official vendor page, or download control is already visible, continue from that visible UI with Python automation and download the installer into `{downloads_root}`. "
-            f"If no grounded visible UI exists yet, open the official vendor site or official release page in Python and continue there. "
+            f"Use executable Python on the Windows machine to obtain the Windows installer `.exe` or `.msi` for the target app from this task: {task}. "
+            f"First inspect the current screenshot and desktop state. If a browser, search results page, relevant vendor/product/download page, or download control is already visible, continue from that visible UI with Python automation and download the installer into `{downloads_root}`. "
+            f"If no grounded visible UI exists yet, open a relevant vendor, product, or download page in Python and continue there. "
             f"If the soft continuity file `{context_path}` already points to a valid installer for this task and that file still exists, you may reuse it instead of downloading again, but validate it before trusting it. "
             f"Do not require the final downloaded filename to contain the app name; browser downloads may use temporary or vendor-specific filenames. "
             f"If you confirm or obtain a valid installer, update `{context_path}` with the exact installer path, source URL, and target keywords so later chunks can continue from it. "
-            f"Do not use `.zip`, portable, or archive downloads."
+            "Prefer `.exe` or `.msi` installers when the current page exposes them directly. "
+            "If the relevant page only exposes a Windows installer package as `.zip` or `.alz`, downloading that archive is allowed."
         )
         install_prompt = (
             f"{_matching_installer_hint(source_task=task, title=install_title, agent_prompt=task, action='실행')} "
@@ -1337,6 +1671,7 @@ def _local_install_chunks(
             f"Launching only the final app executable is not enough for this chunk. "
             f"Prefer reading the soft continuity file `{context_path}` first; if it names a valid installer path for this task, reuse that exact path instead of searching Downloads broadly, but ignore it if validation fails. "
             f"If no installer UI is visible yet, find the existing installer `.exe` or `.msi` in `{downloads_root}`, launch it once, and then continue from the resulting installer UI. "
+            f"{archive_install_hint} "
             f"Only after installer progression should you check likely install directories such as `{likely_install_paths}` for the installed app executable. Avoid recursively scanning the whole of `%LOCALAPPDATA%` or `%ProgramFiles%`. "
             f"Do not import `pywin32`, `pywinauto`, `win32gui`, `win32con`, `win32api`, or `pythoncom`. Prefer the standard library, `psutil`, `pyautogui`, and `pygetwindow` only if clearly needed. "
             f"Fail explicitly if no valid installer is found or if the install still has not produced the app executable. "
@@ -1344,12 +1679,13 @@ def _local_install_chunks(
         )
     else:
         download_prompt = (
-            f"Use executable Python on the Windows machine to download the official Windows installer `.exe` or `.msi` for the target app from this task: {task}. "
-            f"Prefer the official vendor site or official release pages, resolve the current Windows x86_64 setup `.exe` or `.msi` URL in Python, and save it to `{downloads_root}`. "
+            f"Use executable Python on the Windows machine to download the Windows installer `.exe` or `.msi` for the target app from this task: {task}. "
+            f"Prefer a relevant vendor, product, or download page, resolve the current Windows x86_64 setup `.exe` or `.msi` URL in Python, and save it to `{downloads_root}`. "
             f"If the soft continuity file `{context_path}` already points to a valid installer for this task and that file still exists, you may reuse it instead of downloading again, but validate it before trusting it. "
-            f"If one official page does not expose a raw `.exe` link or `.msi` link, inspect another official page or official release page in the same script before failing. "
+            f"If one page does not expose a raw `.exe` link or `.msi` link, inspect another relevant page in the same script before failing. "
             f"After you confirm or obtain a valid installer, update `{context_path}` with the exact installer path. "
-            f"Do not use `.zip`, portable, or archive downloads."
+            "Prefer `.exe` or `.msi` installers when the current page exposes them directly. "
+            "If the relevant page only exposes a Windows installer package as `.zip` or `.alz`, downloading that archive is allowed."
         )
         install_prompt = (
             f"{_matching_installer_hint(source_task=task, title=install_title, agent_prompt=task, action='실행')} "
@@ -1359,6 +1695,7 @@ def _local_install_chunks(
             f"Prefer reading the soft continuity file `{context_path}` first; if it names a valid installer path for this task, reuse that exact path instead of searching Downloads broadly, but ignore it if validation fails. "
             f"If the app is not already installed, the script must either launch the installer `.exe` or `.msi` itself or operate a visible installer window with Python GUI automation. "
             f"If no installer UI is visible, find the existing installer `.exe` or `.msi` in `{downloads_root}`, launch it once, wait long enough for setup to appear or continue, and then check only likely install directories such as `{likely_install_paths}` for the installed app executable. Avoid recursively scanning the whole of `%LOCALAPPDATA%` or `%ProgramFiles%`. "
+            f"{archive_install_hint} "
             f"Do not import `pywin32`, `pywinauto`, `win32gui`, `win32con`, `win32api`, or `pythoncom`. Prefer the standard library, `psutil`, `pyautogui`, and `pygetwindow` only if clearly needed. "
             f"Fail explicitly if no valid installer is found or if the install still has not produced the app executable. "
             f"End only when the installed app `.exe` exists on disk, `{install_marker_path}` contains the discovered executable path, and `{context_path}` is updated with the same installed executable."
@@ -1548,6 +1885,84 @@ def _extract_json_object(text: str) -> dict:
     return payload
 
 
+def _extract_link_candidate_urls(text: str, *, task: str, limit: int = 5) -> list[str]:
+    try:
+        payload = _extract_json_object(text)
+    except Exception:
+        payload = {}
+    raw_urls = payload.get("candidate_urls")
+    if not isinstance(raw_urls, list):
+        raw_urls = re.findall(r"https?://[^\s\"'<>]+", str(text or ""))
+    urls: list[str] = []
+    for raw_url in raw_urls:
+        url = str(raw_url or "").strip().rstrip(".,)")
+        if not url:
+            continue
+        urls.append(url)
+    sanitized = _sanitize_discovered_official_urls(task, urls, limit=limit)
+    if sanitized:
+        return sanitized
+    # If the teacher supplied product-specific pages that fail the stricter
+    # official-page filter, keep safe non-reference pages rather than losing the retry hint entirely.
+    kept: list[str] = []
+    seen: set[str] = set()
+    task_keywords = [keyword.lower() for keyword in _target_installer_keywords(task, limit=6)]
+    for raw_url in urls:
+        parsed = urllib.parse.urlparse(raw_url)
+        if parsed.scheme not in {"http", "https"} or not parsed.netloc:
+            continue
+        host = str(parsed.netloc or "").lower()
+        if any(token in host for token in _NON_VENDOR_RESULT_HOST_TOKENS):
+            continue
+        if host == "apps.microsoft.com":
+            continue
+        combined = urllib.parse.unquote(f"{host}{parsed.path}").lower()
+        if task_keywords and not any(keyword in combined for keyword in task_keywords if len(keyword) >= 3):
+            continue
+        if raw_url in seen:
+            continue
+        seen.add(raw_url)
+        kept.append(raw_url)
+        if len(kept) >= limit:
+            break
+    return kept
+
+
+def run_teacher_link_candidates(
+    *,
+    task: str,
+    chunk_title: str,
+    chunk_prompt: str,
+    failure_context: str,
+    command_template: str,
+    cwd: str | None,
+    timeout_s: float,
+    limit: int = 5,
+) -> TeacherResult:
+    prompt = _REPLAN_LINK_CANDIDATE_PROMPT_TEMPLATE.format(
+        task=task.strip(),
+        chunk_title=chunk_title.strip(),
+        chunk_prompt=chunk_prompt.strip(),
+        failure_context=failure_context.strip(),
+    )
+    result, response_text = _run_teacher_command(
+        prompt=prompt,
+        command_template=command_template,
+        cwd=cwd,
+        timeout_s=timeout_s,
+    )
+    urls = _extract_link_candidate_urls(response_text, task=task, limit=limit)
+    normalized_response = json.dumps(
+        {
+            "candidate_urls": urls,
+            "raw_response": response_text,
+        },
+        ensure_ascii=False,
+        indent=2,
+    )
+    return TeacherResult(prompt=prompt, response_text=normalized_response, command_result=result)
+
+
 def _normalize_chunks(
     payload: dict,
     *,
@@ -1572,6 +1987,7 @@ def _normalize_chunks(
             source_task=source_task,
             title=title,
             agent_prompt=agent_prompt,
+            source_text=source_text,
             execution_style=normalized_style,
         )
         agent_prompt = _normalize_general_gui_agent_prompt(
@@ -1589,10 +2005,46 @@ def _normalize_chunks(
             verification=verification,
         )
         target_keywords = _target_installer_keywords(source_task, title, agent_prompt, limit=6)
+        source_target_keywords = _target_installer_keywords(source_task, limit=6) or target_keywords
         if _looks_like_install_task(source_task):
-            if (
-                _looks_like_install_execution_chunk(title, agent_prompt)
-                and not _verification_has_kind(verification, "json_marker_valid_exe")
+            is_download_stage = _looks_like_download_chunk(title, agent_prompt)
+            combined_stage = f"{title}\n{agent_prompt}".lower()
+            is_install_stage = _looks_like_install_execution_chunk(title, agent_prompt) or (
+                not is_download_stage
+                and any(
+                    token in combined_stage
+                    for token in (
+                        "install and launch",
+                        "run installer",
+                        "run the installer",
+                        "launch the installer",
+                        "proceed through the installer",
+                        "설치 실행",
+                        "설치 진행",
+                    )
+                )
+            )
+            if normalized_style == "gui_first" and is_download_stage:
+                verification = {
+                    "checks": [
+                        {
+                            "kind": "json_marker_valid_installer",
+                            "path": "~/Downloads/computer-use-agent-context.json",
+                            "field": "installer_path",
+                            "keywords": source_target_keywords,
+                            "bytes": 1_000_000,
+                            "allowed_suffixes": [".exe", ".msi", ".zip", ".alz"],
+                        }
+                    ]
+                }
+            elif is_install_stage and not (
+                _verification_has_path_exists(verification, "~/Downloads/install-success.json")
+                and _verification_has_json_marker_check(
+                    verification,
+                    kind="json_marker_valid_exe",
+                    marker_path="~/Downloads/install-success.json",
+                    field="installed_exe",
+                )
             ):
                 verification = {
                     "checks": [
@@ -1601,11 +2053,19 @@ def _normalize_chunks(
                             "kind": "json_marker_valid_exe",
                             "path": "~/Downloads/install-success.json",
                             "field": "installed_exe",
-                            "keywords": target_keywords,
+                            "keywords": source_target_keywords,
                         },
                     ]
                 }
-            elif _looks_like_launch_execution_chunk(title, agent_prompt) and not _verification_has_kind(verification, "json_marker_valid_exe"):
+            elif _looks_like_launch_execution_chunk(title, agent_prompt) and not (
+                _verification_has_path_exists(verification, "~/Downloads/launch-success.json")
+                and _verification_has_json_marker_check(
+                    verification,
+                    kind="json_marker_valid_exe",
+                    marker_path="~/Downloads/launch-success.json",
+                    field="launched_exe",
+                )
+            ):
                 verification = {
                     "checks": [
                         {"kind": "path_exists", "path": "~/Downloads/launch-success.json"},
@@ -1613,7 +2073,7 @@ def _normalize_chunks(
                             "kind": "json_marker_valid_exe",
                             "path": "~/Downloads/launch-success.json",
                             "field": "launched_exe",
-                            "keywords": target_keywords,
+                            "keywords": source_target_keywords,
                         },
                     ]
                 }

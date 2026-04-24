@@ -8,8 +8,10 @@ from computer_use_training_generator.verification import (
 from computer_use_training_generator.teacher import (
     _decode_bing_result_url,
     _extract_bing_result_candidates,
+    _extract_link_candidate_urls,
     _looks_like_install_execution_chunk,
     _looks_like_plausible_official_page_url,
+    _looks_like_store_detour_prompt,
     _merge_gui_first_navigation_chunks,
     _normalize_chunks,
     build_local_teacher_fallback,
@@ -21,7 +23,14 @@ from computer_use_training_generator.teacher import (
     _task_staging_subdir,
     _target_installer_keywords,
 )
-from computer_use_training_generator.cli import _compose_chunk_prompt, _compose_retry_prompt
+from computer_use_training_generator.cli import (
+    _compose_chunk_prompt,
+    _compose_retry_prompt,
+    _extract_verified_installer_paths,
+    _teacher_link_candidate_urls_from_result,
+    _should_stop_after_install_completion,
+    _teacher_execution_style_context,
+)
 from computer_use_training_generator.models import TeacherTaskChunk
 
 
@@ -30,6 +39,80 @@ def test_expanded_glob_patterns_adds_windows_setup_aliases() -> None:
     assert "~/Downloads/dbeaver-ce-*-windows-x86_64.exe" in patterns
     assert "~/Downloads/dbeaver-ce-*-x86_64-setup.exe" in patterns
     assert "~/Downloads/dbeaver-ce-*-setup.exe" in patterns
+
+
+def test_extract_link_candidate_urls_keeps_product_specific_pages() -> None:
+    text = (
+        '{"candidate_urls":['
+        '"https://www.google.com/search?q=filezilla",'
+        '"https://filezilla-project.org/download.php?type=client",'
+        '"https://www.youtube.com/watch?v=bad",'
+        '"https://filezilla.kr/download"'
+        "]}"
+    )
+
+    urls = _extract_link_candidate_urls(text, task="filezilla 설치해줘", limit=5)
+
+    assert "https://filezilla-project.org/download.php?type=client" in urls
+    assert "https://filezilla.kr/download" in urls
+    assert all("google." not in url and "youtube." not in url for url in urls)
+
+
+def test_compose_retry_prompt_includes_teacher_candidate_urls() -> None:
+    chunk = TeacherTaskChunk(
+        chunk_id="chunk-001",
+        title="Download installer",
+        agent_prompt="Download the Windows installer into Downloads.",
+        success_hint="installer exists",
+        verification={"checks": [{"kind": "json_marker_valid_installer"}]},
+        max_retries=1,
+        on_fail="retry_current_chunk",
+    )
+    prompt = _compose_retry_prompt(
+        chunk=chunk,
+        verification_result={"passed": False, "evidence": []},
+        attempt_index=1,
+        execution_style="gui_first",
+        candidate_urls=[
+            "https://example.com/download",
+            "https://downloads.example.com/app",
+        ],
+    )
+
+    assert "Teacher-provided candidate page URLs for this retry" in prompt
+    assert "- https://example.com/download" in prompt
+    assert "Open these pages in order before generic search" in prompt
+
+
+def test_teacher_link_candidate_urls_from_result_parses_normalized_response() -> None:
+    text = '{"candidate_urls":["https://example.com/download","ftp://bad"],"raw_response":"{}"}'
+
+    assert _teacher_link_candidate_urls_from_result(text) == ["https://example.com/download"]
+
+
+def test_extract_verified_installer_paths_skips_keyword_mismatched_marker() -> None:
+    result = {
+        "passed": True,
+        "evidence": [
+            {
+                "kind": "json_marker_valid_installer",
+                "passed": True,
+                "resolved_path": r"C:\Users\qkqxl\Downloads\DeskRest_n.exe",
+                "keywords": ["filezilla"],
+                "keyword_hits": [],
+                "marker_keyword_hits": ["filezilla"],
+            },
+            {
+                "kind": "json_marker_valid_installer",
+                "passed": True,
+                "resolved_path": r"C:\Users\qkqxl\Downloads\FileZilla_Setup.exe",
+                "keywords": ["filezilla"],
+                "keyword_hits": ["filezilla"],
+            },
+        ],
+    }
+
+    assert _extract_verified_installer_paths(result) == [r"C:\Users\qkqxl\Downloads\FileZilla_Setup.exe"]
 
 
 def test_expanded_glob_patterns_adds_aliases_for_windows_wildcard_suffix() -> None:
@@ -45,6 +128,12 @@ def test_expanded_glob_patterns_relaxes_brittle_windows_installer_glob() -> None
     assert "~/Downloads/*dbeaver*win*setup*.exe" in patterns
     assert "~/Downloads/*dbeaver*.exe" in patterns
     assert "~/Downloads/*dbeaver*.msi" in patterns
+
+
+def test_expanded_glob_patterns_relaxes_exact_arch_installer_name() -> None:
+    patterns = _expanded_glob_patterns("~/Downloads/DB.Browser.for.SQLite-v3.13.1-win64.msi")
+    assert "~/Downloads/DB.Browser.for.SQLite-v3.13.1-win64.msi" in patterns
+    assert "~/Downloads/DB.Browser.for.SQLite-v3.13.1-*.msi" in patterns
 
 
 def test_has_file_based_checks_detects_download_verifiers() -> None:
@@ -103,6 +192,9 @@ def test_build_verification_code_supports_json_marker_valid_exe() -> None:
     )
     assert code is not None
     assert "_validate_json_marker_exe" in code
+    assert "marker_target_keywords" in code
+    exe_block = code.split("def _validate_json_marker_exe", 1)[1].split("def _fallback_installer_candidates", 1)[0]
+    assert "min_bytes" not in exe_block
 
 
 def test_build_verification_code_supports_json_marker_valid_installer() -> None:
@@ -121,8 +213,79 @@ def test_build_verification_code_supports_json_marker_valid_installer() -> None:
     )
     assert code is not None
     assert "_validate_json_marker_installer" in code
+    assert "fallback_used" not in code
+    assert "fallback_candidates = _fallback_installer_candidates(keywords, min_bytes, allowed_suffixes)" not in code
+    assert 'entry["error"] = "missing_field_value"' in code
     assert "source_url" in code
-    assert 'allowed_suffixes = {".exe", ".msi"}' in code
+    installer_block = code.split("def _validate_json_marker_installer", 1)[1].split("evidence = []", 1)[0]
+    assert "keyword_hits = [keyword for keyword in normalized_keywords if keyword in candidate_keyword_haystack]" in installer_block
+    assert "marker_keyword_hits = [keyword for keyword in normalized_keywords if keyword in marker_keyword_haystack]" in installer_block
+    assert "keyword_ok = not normalized_keywords or bool(keyword_hits)" in installer_block
+    assert 'entry["error"] = "installer_path_keyword_mismatch"' in installer_block
+    assert "normalized_allowed_suffixes" in code
+
+
+def test_build_verification_code_supports_archive_allowed_marker_installer() -> None:
+    code = build_verification_code(
+        {
+            "checks": [
+                {
+                    "kind": "json_marker_valid_installer",
+                    "path": "~/Downloads/computer-use-agent-context.json",
+                    "field": "installer_path",
+                    "keywords": ["mobaxterm"],
+                    "bytes": 1000000,
+                    "allowed_suffixes": [".zip", ".alz"],
+                }
+            ]
+        }
+    )
+    assert code is not None
+    assert "normalized_allowed_suffixes" in code
+    assert "allowed_suffixes = check.get(\"allowed_suffixes\") or []" in code
+    assert '".zip"' in code
+    assert '".alz"' in code
+
+
+def test_build_verification_code_does_not_accept_keyword_mismatched_fallback_installer() -> None:
+    code = build_verification_code(
+        {
+            "checks": [
+                {
+                    "kind": "json_marker_valid_installer",
+                    "path": "~/Downloads/computer-use-agent-context.json",
+                    "field": "installer_path",
+                    "keywords": ["mobaxterm"],
+                    "bytes": 1000000,
+                }
+            ]
+        }
+    )
+    assert code is not None
+    assert "if normalized_keywords and not keyword_hits:" in code
+    assert "keyword_ok = not normalized_keywords or bool(keyword_hits)" in code
+    assert "or bool(marker_keyword_hits)" not in code
+
+
+def test_build_verification_code_rejects_marker_keyword_when_installer_path_mismatches() -> None:
+    code = build_verification_code(
+        {
+            "checks": [
+                {
+                    "kind": "json_marker_valid_installer",
+                    "path": "~/Downloads/computer-use-agent-context.json",
+                    "field": "installer_path",
+                    "keywords": ["filezilla"],
+                    "bytes": 1000000,
+                }
+            ]
+        }
+    )
+
+    assert code is not None
+    assert "marker_keyword_hits" in code
+    assert "keyword_ok = not normalized_keywords or bool(keyword_hits)" in code
+    assert "installer_path_keyword_mismatch" in code
 
 
 def test_install_execution_chunk_does_not_match_download_stage_prompt() -> None:
@@ -157,10 +320,10 @@ def test_normalize_windows_installer_agent_prompt_adds_reuse_hint() -> None:
     assert "실행 가능한 Python 코드만으로 수행" in prompt
     assert "curl, wget, powershell, http.server 같은 외부 도구" in prompt
     assert "os.environ" in prompt
-    assert "다른 공식 페이지나 공식 release 페이지도 확인" in prompt
+    assert "다른 관련 페이지도 확인" in prompt
     assert "absolute https .exe URL 후보" in prompt
     assert ".msi URL 후보" in prompt
-    assert "공식 source는 작업과 일치하는 vendor site" in prompt
+    assert "작업과 일치하는 vendor, product, download 페이지를 우선 사용" in prompt
     assert "하드코딩된 버전 번호나 추측한 파일명으로 점프하지 말고" in prompt
     assert "이미 Downloads 폴더에 사용할 수 있는 대상 앱의 Windows installer" in prompt
 
@@ -188,7 +351,7 @@ def test_target_installer_keywords_filters_generic_english_words() -> None:
 
 def test_target_installer_keywords_filters_for_from_db_browser_task() -> None:
     keywords = _target_installer_keywords("DB Browser for SQLite 프로그램을 설치해줘", limit=3)
-    assert "sqlite" in keywords
+    assert keywords == ["db", "browser", "sqlite"]
     assert "for" not in keywords
 
 
@@ -203,7 +366,7 @@ def test_local_install_marker_keywords_ignore_discovered_url_noise() -> None:
     )
     install_checks = teacher_plan.chunks[1].verification["checks"]
     marker_check = next(check for check in install_checks if check["kind"] == "json_marker_valid_exe")
-    assert marker_check["keywords"] == ["sqlite"]
+    assert marker_check["keywords"] == ["db", "browser", "sqlite"]
 
 
 def test_target_installer_keywords_filter_template_words_from_gui_first_prompt() -> None:
@@ -226,6 +389,12 @@ def test_target_installer_keywords_extract_korean_app_name() -> None:
     assert "카카오톡" in keywords
     assert "프로그램을" not in keywords
     assert "설치해줘" not in keywords
+
+
+def test_target_installer_keywords_filter_download_command_suffixes() -> None:
+    keywords = _target_installer_keywords("filezilla 설치파일을 다운로드해줘", limit=3)
+    assert "filezilla" in keywords
+    assert "다운로드해줘" not in keywords
 
 
 def test_decode_bing_result_url_decodes_redirect_payload() -> None:
@@ -259,6 +428,23 @@ def test_extract_bing_result_candidates_and_select_official_urls_prefer_corporat
     assert "pc-kakaocorp.com" not in urls[0]
 
 
+def test_select_official_page_urls_rejects_unrelated_seo_results_without_task_keyword_hits() -> None:
+    candidates = [
+        {
+            "url": "https://wellhealthorganics.com.in/",
+            "title": "Well Health Organics",
+            "snippet": "Health tips and organic lifestyle articles.",
+        },
+        {
+            "url": "https://appexpress.ai/download/",
+            "title": "메모잇 다운로드 | AppExpress",
+            "snippet": "메모잇 공식 다운로드 페이지",
+        },
+    ]
+    urls = _select_official_page_urls("메모잇 설치해줘", candidates, limit=2)
+    assert urls == ["https://appexpress.ai/download/"]
+
+
 def test_normalize_windows_installer_agent_prompt_adds_install_chunk_guidance() -> None:
     prompt = _normalize_windows_installer_agent_prompt(
         source_task="dbeaver를 설치해줘",
@@ -283,6 +469,7 @@ def test_normalize_windows_installer_agent_prompt_does_not_add_run_hint_to_downl
     )
     assert "실행할 installer는" not in prompt
     assert "새로 받지 말고" in prompt
+    assert "핵심 키워드 2~5개" in prompt
 
 
 def test_normalize_windows_installer_agent_prompt_keeps_download_chunk_as_download_when_text_mentions_finishing() -> None:
@@ -342,10 +529,60 @@ def test_compose_chunk_prompt_gui_first_mentions_visible_ui() -> None:
         execution_style="gui_first",
     )
     assert "currently visible browser" in prompt
-    assert "do not switch to fresh direct HTTP fetching" in prompt
-    assert "use the screenshot to choose grounded page-content coordinates" in prompt
-    assert "keep that same tab/page first" in prompt
-    assert "do not click the browser toolbar, address bar, tab strip" in prompt
+    assert "Use screenshot-grounded page-content actions first" in prompt
+    assert "avoid toolbar/address/tab/bookmark/blank-margin clicks" in prompt
+    assert "do not ask a human to take manual GUI actions" in prompt
+
+
+def test_should_stop_after_install_completion_for_plain_install_task() -> None:
+    chunk = TeacherTaskChunk(
+        chunk_id="chunk-002",
+        title="Run installer",
+        agent_prompt="Launch the downloaded official installer and complete setup with default options.",
+        success_hint="The installer finishes and the app is installed on the machine.",
+        preconditions=[],
+        verification=None,
+        max_retries=0,
+        on_fail="fail_session",
+        notes=[],
+    )
+    assert _should_stop_after_install_completion("filezilla 설치해줘", chunk) is True
+
+
+def test_should_not_stop_after_download_or_explicit_launch_task() -> None:
+    download_chunk = TeacherTaskChunk(
+        chunk_id="chunk-001",
+        title="Download installer",
+        agent_prompt="Download installer into Downloads.",
+        success_hint="The installer exists in Downloads.",
+        preconditions=[],
+        verification=None,
+        max_retries=0,
+        on_fail="fail_session",
+        notes=[],
+    )
+    run_chunk = TeacherTaskChunk(
+        chunk_id="chunk-002",
+        title="Run installer",
+        agent_prompt="Launch the downloaded official installer and complete setup.",
+        success_hint="The installer finishes and the app is installed on the machine.",
+        preconditions=[],
+        verification=None,
+        max_retries=0,
+        on_fail="fail_session",
+        notes=[],
+    )
+    assert _should_stop_after_install_completion("filezilla 설치해줘", download_chunk) is False
+    assert _should_stop_after_install_completion("filezilla 설치하고 실행해줘", run_chunk) is False
+
+
+def test_teacher_execution_style_context_blocks_store_detours() -> None:
+    gui_context = _teacher_execution_style_context("gui_first")
+    python_context = _teacher_execution_style_context("python_first")
+    assert "do not route through Microsoft Store" in gui_context
+    assert "winget" in gui_context
+    assert "do not route through Microsoft Store" in python_context
+    assert "Windows `.exe`/`.msi` installer when one is available" in python_context
 
 
 def test_compose_retry_prompt_gui_first_keeps_same_page_and_download_only() -> None:
@@ -372,6 +609,8 @@ def test_compose_retry_prompt_gui_first_keeps_same_page_and_download_only() -> N
     assert "Do not guess a new direct installer URL" in prompt
     assert "Do not launch or silently install the installer in this chunk." in prompt
     assert "Do not use browser toolbar/address/tab/bookmark areas as click targets." in prompt
+    assert "keep these exact task/product keywords in the query: memoit" in prompt.lower()
+    assert "Do not replace those task/product keywords with generic retry wording" in prompt
 
 
 def test_normalize_chunks_adds_file_size_check_for_windows_download_chunk() -> None:
@@ -395,7 +634,8 @@ def test_normalize_chunks_adds_file_size_check_for_windows_download_chunk() -> N
         execution_style="gui_first",
     )
     checks = chunks[0].verification["checks"]
-    assert any(check["kind"] == "file_size_gt" for check in checks)
+    assert any(check["kind"] == "json_marker_valid_installer" for check in checks)
+    assert not any(check["kind"] == "file_size_gt" for check in checks)
 
 
 def test_normalize_chunks_adds_file_size_check_for_windows_msi_download_chunk() -> None:
@@ -419,7 +659,9 @@ def test_normalize_chunks_adds_file_size_check_for_windows_msi_download_chunk() 
         execution_style="gui_first",
     )
     checks = chunks[0].verification["checks"]
-    assert any(check["kind"] == "file_size_gt" and check["pattern"] == "~/Downloads/*sqlite*.msi" for check in checks)
+    marker_check = next(check for check in checks if check["kind"] == "json_marker_valid_installer")
+    assert marker_check["path"] == "~/Downloads/computer-use-agent-context.json"
+    assert ".msi" in marker_check["allowed_suffixes"]
 
 
 def test_normalize_chunks_keeps_download_chunk_verifier_as_download_checks() -> None:
@@ -449,8 +691,9 @@ def test_normalize_chunks_keeps_download_chunk_verifier_as_download_checks() -> 
         execution_style="gui_first",
     )
     checks = chunks[0].verification["checks"]
-    assert any(check["kind"] == "file_exists_glob" for check in checks)
-    assert any(check["kind"] == "file_size_gt" for check in checks)
+    assert any(check["kind"] == "json_marker_valid_installer" for check in checks)
+    assert not any(check["kind"] == "file_exists_glob" for check in checks)
+    assert not any(check["kind"] == "file_size_gt" for check in checks)
     assert not any(check["kind"] == "json_marker_valid_exe" for check in checks)
     assert not any(check.get("path") == "~/Downloads/install-success.json" for check in checks)
 
@@ -520,6 +763,37 @@ def test_normalize_chunks_replaces_msi_install_path_alternatives_with_marker_ver
     assert not any(str(check.get("path", "")).startswith("C:/Program Files") for check in checks)
 
 
+def test_normalize_chunks_replaces_start_menu_process_install_verifier_with_marker() -> None:
+    chunks = _normalize_chunks(
+        {
+            "chunks": [
+                {
+                    "chunk_id": "chunk-003",
+                    "title": "Run installer and verify app launch",
+                    "agent_prompt": (
+                        "Use Python to launch the installer executable found in the previous step and proceed through "
+                        "the installer with default choices. After installation finishes, verify the app is installed "
+                        "by checking for its program files entry or Start Menu shortcut, then launch it once."
+                    ),
+                    "verification": {
+                        "checks": [
+                            {"kind": "path_exists", "path": "~/AppData/Roaming/Microsoft/Windows/Start Menu/Programs/TargetApp.lnk"},
+                            {"kind": "process_exists", "name": "TargetApp.exe"},
+                        ]
+                    },
+                }
+            ]
+        },
+        source_task="TargetApp 프로그램을 설치해줘",
+        source_text="dummy",
+        execution_style="gui_first",
+    )
+    checks = chunks[0].verification["checks"]
+    assert any(check["kind"] == "path_exists" and check["path"] == "~/Downloads/install-success.json" for check in checks)
+    assert any(check["kind"] == "json_marker_valid_exe" for check in checks)
+    assert not any(check.get("path") == "~/AppData/Roaming/Microsoft/Windows/Start Menu/Programs/TargetApp.lnk" for check in checks)
+
+
 def test_normalize_chunks_keeps_checksum_chunk_when_task_requests_checksum() -> None:
     chunks = _normalize_chunks(
         {
@@ -587,7 +861,7 @@ def test_build_local_teacher_fallback_for_install_task_produces_python_first_chu
     assert "external teacher was unavailable" in teacher_result.response_text
     assert len(teacher_plan.chunks) == 3
     assert "Python" in teacher_plan.chunks[0].agent_prompt
-    assert "If one official page does not expose a raw `.exe` link" in teacher_plan.chunks[0].agent_prompt
+    assert "If one page does not expose a raw `.exe` link" in teacher_plan.chunks[0].agent_prompt
     assert any(check["kind"] == "file_exists_glob" for check in teacher_plan.chunks[0].verification["checks"])
     assert any(check["kind"] == "path_exists" for check in teacher_plan.chunks[1].verification["checks"])
     assert any(check["kind"] == "json_marker_valid_exe" for check in teacher_plan.chunks[1].verification["checks"])
@@ -633,7 +907,7 @@ def test_build_local_teacher_fallback_for_korean_task_uses_real_app_token() -> N
     checks = download_chunk.verification["checks"]
     download_marker_check = next(check for check in checks if check["kind"] == "json_marker_valid_installer")
     assert download_marker_check["path"] == "~/Downloads/computer-use-agent-context.json"
-    assert "kakaotalk" in download_marker_check["keywords"]
+    assert "카카오톡" in download_marker_check["keywords"]
     install_checks = teacher_plan.chunks[1].verification["checks"]
     marker_check = next(check for check in install_checks if check["kind"] == "json_marker_valid_exe")
     assert "카카오톡" in marker_check["keywords"]
@@ -663,17 +937,17 @@ def test_build_local_teacher_fallback_uses_supplied_staging_subdir() -> None:
     assert "custom-stage-1234" not in download_chunk.agent_prompt
     marker_check = next(check for check in download_chunk.verification["checks"] if check["kind"] == "json_marker_valid_installer")
     assert marker_check["path"] == "~/Downloads/computer-use-agent-context.json"
-    assert "kakaotalk" in marker_check["keywords"]
+    assert "카카오톡" in marker_check["keywords"]
 
 
-def test_build_local_teacher_fallback_injects_discovered_official_page_urls() -> None:
+def test_build_local_teacher_fallback_does_not_inject_discovered_urls_without_user_url() -> None:
     with patch(
         "computer_use_training_generator.teacher._discover_official_page_urls",
         return_value=[
             "https://www.kakaocorp.com/page/service/service/KakaoTalk?lang=ko",
             "https://apps.microsoft.com/detail/xp9k178l5g0jq0?hl=ko-KR&gl=CG",
         ],
-    ):
+    ) as discover_mock:
         _, teacher_plan = build_local_teacher_fallback(
             task="카카오톡 pc버전 프로그램을 설치해줘",
             prompt="dummy prompt",
@@ -683,12 +957,59 @@ def test_build_local_teacher_fallback_injects_discovered_official_page_urls() ->
             execution_style="gui_first",
     )
     download_chunk = teacher_plan.chunks[0]
-    assert "Use these exact official page URLs first before any search engine result or inferred domain:" in download_chunk.agent_prompt
-    assert "https://www.kakaocorp.com/page/service/service/KakaoTalk?lang=ko" in download_chunk.agent_prompt
+    discover_mock.assert_not_called()
+    assert "Use these exact official page URLs first before any search engine result or inferred domain:" not in download_chunk.agent_prompt
+    assert "https://www.kakaocorp.com/page/service/service/KakaoTalk?lang=ko" not in download_chunk.agent_prompt
     install_marker_check = next(
         check for check in teacher_plan.chunks[1].verification["checks"] if check["kind"] == "json_marker_valid_exe"
     )
-    assert "kakaotalk" in install_marker_check["keywords"]
+    assert "카카오톡" in install_marker_check["keywords"]
+
+
+def test_build_local_teacher_fallback_keeps_user_provided_url_hint() -> None:
+    _, teacher_plan = build_local_teacher_fallback(
+        task="카카오톡 pc버전 프로그램을 설치해줘 https://www.kakaocorp.com/page/service/service/KakaoTalk?lang=ko",
+        prompt="dummy prompt",
+        command_template="codex exec '{prompt}'",
+        cwd="..",
+        error="teacher quota exhausted",
+        execution_style="gui_first",
+    )
+    download_chunk = teacher_plan.chunks[0]
+    assert "Use these exact page URLs first before any search engine result or inferred domain:" in download_chunk.agent_prompt
+    assert "https://www.kakaocorp.com/page/service/service/KakaoTalk?lang=ko" in download_chunk.agent_prompt
+
+
+def test_normalize_windows_installer_agent_prompt_removes_teacher_invented_url() -> None:
+    prompt = _normalize_windows_installer_agent_prompt(
+        source_task="filezilla 설치해줘",
+        title="Download FileZilla installer",
+        agent_prompt=(
+            "Open a browser and go to the official FileZilla Client download page at "
+            "`https://filezilla-project.org/download.php?type=client`, then download the installer."
+        ),
+        source_text="Teacher answer mentioned https://filezilla-project.org/download.php?type=client",
+        execution_style="gui_first",
+    )
+
+    assert "filezilla-project.org" not in prompt
+    assert "a relevant product/download page" in prompt
+
+
+def test_normalize_windows_installer_agent_prompt_strips_url_added_by_followup_hints() -> None:
+    prompt = _normalize_windows_installer_agent_prompt(
+        source_task="filezilla 설치해줘",
+        title="Download FileZilla installer",
+        agent_prompt=(
+            "Open a browser and go to the official FileZilla Client download page at "
+            "`https://filezilla.run/`, then download the installer."
+        ),
+        source_text="Teacher answer mentioned https://filezilla.run/ and retry from there.",
+        execution_style="gui_first",
+    )
+
+    assert "filezilla.run" not in prompt
+    assert "a relevant product/download page" in prompt
 
 
 def test_plausible_official_page_url_filters_blog_like_article_pages() -> None:
@@ -793,7 +1114,27 @@ def test_build_local_teacher_fallback_uses_context_marker_for_gui_first_download
     marker_checks = [check for check in checks if check["kind"] == "json_marker_valid_installer"]
     assert marker_checks
     assert marker_checks[0]["path"] == "~/Downloads/computer-use-agent-context.json"
-    assert "memoit" in marker_checks[0]["keywords"]
+    assert "메모잇" in marker_checks[0]["keywords"]
+
+
+def test_build_local_teacher_fallback_does_not_keep_discovered_generic_vendor_url_without_user_url() -> None:
+    with patch(
+        "computer_use_training_generator.teacher._discover_official_page_urls",
+        return_value=[
+            "https://appexpress.ai/download/",
+        ],
+    ) as discover_mock:
+        _, teacher_plan = build_local_teacher_fallback(
+            task="메모잇 설치해줘",
+            prompt="dummy prompt",
+            command_template="codex exec '{prompt}'",
+            cwd="..",
+            error="teacher quota exhausted",
+            execution_style="gui_first",
+        )
+    download_chunk = teacher_plan.chunks[0]
+    discover_mock.assert_not_called()
+    assert "https://appexpress.ai/download/" not in download_chunk.agent_prompt
 
 
 def test_normalize_chunks_replaces_store_detour_plan_for_windows_installer_task() -> None:
@@ -820,6 +1161,48 @@ def test_normalize_chunks_replaces_store_detour_plan_for_windows_installer_task(
     assert not any("apps.microsoft.com" in chunk.agent_prompt.lower() for chunk in chunks)
 
 
+def test_negative_store_warning_does_not_trigger_store_detour_replacement() -> None:
+    chunks = _normalize_chunks(
+        {
+            "chunks": [
+                {
+                    "chunk_id": "chunk-001",
+                    "title": "Download installer",
+                    "agent_prompt": (
+                        "Open the official download page at https://mobaxterm.mobatek.net/download-home-edition.html. "
+                        "If the page only provides an archive package, download that exact official package and do not substitute "
+                        "a third-party source or Microsoft Store."
+                    ),
+                    "verification": {
+                        "checks": [
+                            {"kind": "file_exists_glob", "pattern": "~/Downloads/MobaXterm*"},
+                        ]
+                    },
+                }
+            ]
+        },
+        source_task="mobaxterm을 설치해줘",
+        source_text=(
+            "Use the official MobaXterm Home Edition download page at "
+            "https://mobaxterm.mobatek.net/download-home-edition.html and do not substitute a third-party source or Microsoft Store."
+        ),
+        execution_style="gui_first",
+    )
+    assert len(chunks) == 1
+    assert "mobaxterm.mobatek.net/download-home-edition.html" not in chunks[0].agent_prompt
+    assert "Microsoft Store" in chunks[0].agent_prompt
+    assert not any("local_teacher_fallback" in note for note in chunks[0].notes)
+
+
+def test_looks_like_store_detour_prompt_ignores_negative_store_warning() -> None:
+    assert _looks_like_store_detour_prompt(
+        "Use the official vendor page and do not substitute a third-party source or Microsoft Store."
+    ) is False
+    assert _looks_like_store_detour_prompt(
+        "Open the Microsoft Store listing at https://apps.microsoft.com/detail/example."
+    ) is True
+
+
 def test_normalize_chunks_keeps_store_plan_when_task_explicitly_requests_store() -> None:
     chunks = _normalize_chunks(
         {
@@ -838,6 +1221,55 @@ def test_normalize_chunks_keeps_store_plan_when_task_explicitly_requests_store()
     )
     assert len(chunks) == 1
     assert "apps.microsoft.com" in chunks[0].agent_prompt.lower()
+
+
+def test_normalize_windows_installer_agent_prompt_keeps_official_archive_exception() -> None:
+    prompt = _normalize_windows_installer_agent_prompt(
+        source_task="mobaxterm을 설치해줘",
+        title="Download MobaXterm installer",
+        agent_prompt=(
+            "Open the official MobaXterm Home Edition download page and download the Windows installer package into Downloads. "
+            "Wait until the download is fully complete before finishing this chunk."
+        ),
+        source_text=(
+            "Use the official MobaXterm Home Edition download page at "
+            "https://mobaxterm.mobatek.net/download-home-edition.html. "
+            "If the downloaded package is a `.zip`, extract it in Downloads and run the contained installer."
+        ),
+        execution_style="gui_first",
+    )
+    assert "mobaxterm.mobatek.net/download-home-edition.html" not in prompt
+    assert "exact official archive" in prompt or "`.zip` 또는 `.alz`" in prompt
+    assert "Do not use `.zip`, portable, or archive downloads." not in prompt
+
+
+def test_normalize_chunks_rewrites_wildcard_path_exists_download_verifier_to_glob() -> None:
+    chunks = _normalize_chunks(
+        {
+            "chunks": [
+                {
+                    "chunk_id": "chunk-001",
+                    "title": "Download MobaXterm installer",
+                    "agent_prompt": (
+                        "Open the official page and download the Windows installer package into Downloads. "
+                        "If the page only provides an archive package, download that exact official package."
+                    ),
+                    "verification": {
+                        "checks": [
+                            {"kind": "path_exists", "path": "~/Downloads/MobaXterm*"},
+                        ]
+                    },
+                }
+            ]
+        },
+        source_task="mobaxterm을 설치해줘",
+        source_text="Use the official archive package if the page only provides a .zip installer package.",
+        execution_style="gui_first",
+    )
+    checks = chunks[0].verification["checks"]
+    marker_check = next(check for check in checks if check["kind"] == "json_marker_valid_installer")
+    assert marker_check["path"] == "~/Downloads/computer-use-agent-context.json"
+    assert ".zip" in marker_check["allowed_suffixes"]
 
 
 def test_normalize_chunks_prioritizes_install_marker_verifier_for_installer_run_prompt() -> None:
@@ -869,3 +1301,36 @@ def test_normalize_chunks_prioritizes_install_marker_verifier_for_installer_run_
     assert checks[0]["path"] == "~/Downloads/install-success.json"
     assert checks[1]["kind"] == "json_marker_valid_exe"
     assert checks[1]["field"] == "installed_exe"
+
+
+def test_normalize_chunks_replaces_direct_exe_json_marker_with_launch_marker_verification() -> None:
+    chunks = _normalize_chunks(
+        {
+            "chunks": [
+                {
+                    "chunk_id": "chunk-003",
+                    "title": "Confirm TargetApp is installed",
+                    "agent_prompt": (
+                        "Launch the installed app once, verify it reaches the foreground, "
+                        "and leave a launch marker after it starts."
+                    ),
+                    "verification": {
+                        "checks": [
+                            {
+                                "kind": "json_marker_valid_exe",
+                                "path": "C:/Program Files/TargetApp/TargetApp.exe",
+                            }
+                        ]
+                    },
+                }
+            ]
+        },
+        source_task="TargetApp 프로그램을 설치해줘",
+        source_text="teacher text",
+        execution_style="gui_first",
+    )
+    checks = chunks[0].verification["checks"]
+    assert checks[0] == {"kind": "path_exists", "path": "~/Downloads/launch-success.json"}
+    assert checks[1]["kind"] == "json_marker_valid_exe"
+    assert checks[1]["path"] == "~/Downloads/launch-success.json"
+    assert checks[1]["field"] == "launched_exe"

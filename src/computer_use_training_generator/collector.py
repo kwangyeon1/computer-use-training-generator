@@ -156,6 +156,223 @@ def _append_samples(path: Path, samples: list[dict]) -> None:
             handle.write("\n")
 
 
+def _clean_text_block(text: str | None, *, max_chars: int | None = None) -> str | None:
+    value = str(text or "").strip()
+    if not value:
+        return None
+    value = re.sub(r"\n{3,}", "\n\n", value)
+    if max_chars is not None and max_chars > 0 and len(value) > max_chars:
+        value = value[: max_chars - 3].rstrip() + "..."
+    return value
+
+
+def _quoted_csv(values: list[str] | None) -> str | None:
+    cleaned = [str(value).strip() for value in values or [] if str(value).strip()]
+    if not cleaned:
+        return None
+    return ", ".join(f"`{value}`" for value in cleaned)
+
+
+def _verification_check_summary(check: dict | None) -> str | None:
+    if not isinstance(check, dict):
+        return None
+    kind = str(check.get("kind") or "").strip()
+    if not kind:
+        return None
+    if kind == "path_exists":
+        path = str(check.get("path") or "").strip()
+        return f"- Path `{path}` must exist." if path else None
+    if kind == "file_exists_glob":
+        pattern = str(check.get("pattern") or "").strip()
+        return f"- At least one file matching `{pattern}` must exist." if pattern else None
+    if kind == "file_size_gt":
+        pattern = str(check.get("pattern") or "").strip()
+        threshold = check.get("bytes")
+        if pattern and threshold is not None:
+            return f"- A file matching `{pattern}` must be larger than `{threshold}` bytes."
+        return f"- A downloaded file must be larger than `{threshold}` bytes." if threshold is not None else None
+    if kind == "process_exists":
+        name = str(check.get("name") or check.get("process_name") or "").strip()
+        return f"- Process `{name}` must be running." if name else None
+    if kind == "json_marker_valid_installer":
+        path = str(check.get("path") or "").strip()
+        field = str(check.get("field") or "installer_path").strip()
+        keywords = _quoted_csv(check.get("keywords") if isinstance(check.get("keywords"), list) else [])
+        suffixes = _quoted_csv(check.get("allowed_suffixes") if isinstance(check.get("allowed_suffixes"), list) else [])
+        threshold = check.get("bytes")
+        parts = [f"installer marker `{path}` field `{field}`" if path else f"installer marker field `{field}`"]
+        if keywords:
+            parts.append(f"target keywords {keywords}")
+        if suffixes:
+            parts.append(f"allowed suffixes {suffixes}")
+        if threshold is not None:
+            parts.append(f"size > `{threshold}` bytes")
+        return "- " + "; ".join(parts) + "."
+    if kind == "json_marker_valid_exe":
+        path = str(check.get("path") or "").strip()
+        field = str(check.get("field") or "installed_exe").strip()
+        keywords = _quoted_csv(check.get("keywords") if isinstance(check.get("keywords"), list) else [])
+        parts = [f"exe marker `{path}` field `{field}`" if path else f"exe marker field `{field}`"]
+        if keywords:
+            parts.append(f"target keywords {keywords}")
+        return "- " + "; ".join(parts) + "."
+    return None
+
+
+def _verification_contract_text(verification: dict | None) -> str | None:
+    if not isinstance(verification, dict):
+        return None
+    checks = verification.get("checks")
+    if not isinstance(checks, list):
+        return None
+    lines = [line for line in (_verification_check_summary(item) for item in checks) if line]
+    if not lines:
+        return None
+    return "\n".join(lines)
+
+
+def _verification_result_summary_entry(entry: dict | None) -> str | None:
+    if not isinstance(entry, dict):
+        return None
+    kind = str(entry.get("kind") or "").strip()
+    passed = bool(entry.get("passed"))
+    status = "passed" if passed else "failed"
+    if kind in {"json_marker_valid_installer", "json_marker_valid_exe"}:
+        candidate = str(entry.get("resolved_path") or entry.get("value") or "").strip()
+        keyword_hits = _quoted_csv(entry.get("keyword_hits") if isinstance(entry.get("keyword_hits"), list) else [])
+        suffix = str(entry.get("suffix") or "").strip()
+        parts = [f"{kind}: {status}"]
+        if candidate:
+            parts.append(f"candidate `{candidate}`")
+        if suffix:
+            parts.append(f"suffix `{suffix}`")
+        if keyword_hits:
+            parts.append(f"keyword hits {keyword_hits}")
+        if entry.get("fallback_used"):
+            parts.append("fallback candidate used")
+        return "- " + "; ".join(parts) + "."
+    if kind in {"file_exists_glob", "file_size_gt"}:
+        pattern = str(entry.get("pattern") or "").strip()
+        matches = entry.get("matches") if isinstance(entry.get("matches"), list) else []
+        return f"- {kind}: {status}; pattern `{pattern}`; matches `{len(matches)}`."
+    if kind == "path_exists":
+        path = str(entry.get("path") or "").strip()
+        return f"- path_exists: {status}; path `{path}`."
+    if kind == "process_exists":
+        name = str(entry.get("name") or "").strip()
+        return f"- process_exists: {status}; process `{name}`."
+    return f"- {kind or 'unknown'}: {status}."
+
+
+def _verification_result_text(verification_result: dict | None) -> str | None:
+    if not isinstance(verification_result, dict):
+        return None
+    evidence = verification_result.get("evidence")
+    if not isinstance(evidence, list):
+        return None
+    lines = [line for line in (_verification_result_summary_entry(item) for item in evidence[:5]) if line]
+    if not lines:
+        return None
+    return "\n".join(lines)
+
+
+def _recent_result_text(recent_result: dict | None) -> str | None:
+    if not isinstance(recent_result, dict):
+        return None
+    parts: list[str] = []
+    return_code = recent_result.get("return_code")
+    if return_code is not None:
+        parts.append(f"return_code={return_code}")
+    stderr_tail = _clean_text_block(recent_result.get("stderr_tail"), max_chars=400)
+    if stderr_tail:
+        parts.append(f"stderr_tail={stderr_tail}")
+    error_info = recent_result.get("error_info")
+    if error_info:
+        parts.append(f"error_info={json.dumps(error_info, ensure_ascii=False)}")
+    if not parts:
+        return None
+    return "\n".join(parts)
+
+
+def _retry_context_text(sample: dict) -> str | None:
+    reasons = [str(item).strip() for item in (sample.get("replan_reasons") or []) if str(item).strip()]
+    if not reasons and not bool(sample.get("replan_requested")) and int(sample.get("chunk_attempt") or 0) <= 1:
+        return None
+    lines: list[str] = []
+    if reasons:
+        lines.append("Replan Reasons:")
+        lines.extend(f"- {reason}" for reason in reasons[:8])
+    if int(sample.get("chunk_attempt") or 0) > 1:
+        lines.append(f"Retry Attempt: {int(sample.get('chunk_attempt') or 0)}")
+    if bool(sample.get("replan_requested")):
+        lines.append("This sample comes from a replan/retry attempt.")
+    return "\n".join(lines) if lines else None
+
+
+def _build_train_input_text(sample: dict) -> str | None:
+    task = _clean_text_block(sample.get("task"), max_chars=800)
+    agent_prompt = _clean_text_block(sample.get("agent_prompt"), max_chars=6000)
+    if not task or not agent_prompt:
+        return None
+    sections = [f"Task:\n{task}"]
+    chunk_title = _clean_text_block(sample.get("chunk_title"), max_chars=400)
+    if chunk_title:
+        sections.append(f"Chunk:\n{chunk_title}")
+    sections.append(f"Agent Prompt:\n{agent_prompt}")
+    verification_contract_text = _clean_text_block(sample.get("verification_contract_text"), max_chars=2000)
+    if verification_contract_text:
+        sections.append(f"Verifier Contract:\n{verification_contract_text}")
+    state_text = _clean_text_block(sample.get("state_text"), max_chars=2000)
+    if state_text:
+        sections.append(f"Current Observation:\n{state_text}")
+    recent_result_text = _clean_text_block(_recent_result_text(sample.get("recent_result")), max_chars=1000)
+    if recent_result_text:
+        sections.append(f"Recent Execution Result:\n{recent_result_text}")
+    retry_context_text = _clean_text_block(_retry_context_text(sample), max_chars=1000)
+    if retry_context_text:
+        sections.append(f"Retry Context:\n{retry_context_text}")
+    sections.append("Return executable Python only.")
+    return "\n\n".join(sections)
+
+
+def _build_train_sample(sample: dict) -> dict | None:
+    target_code = _clean_text_block(sample.get("target_code"))
+    input_text = _build_train_input_text(sample)
+    if not target_code or not input_text:
+        return None
+    return {
+        "session_id": sample.get("session_id"),
+        "task": sample.get("task"),
+        "chunk_id": sample.get("chunk_id"),
+        "chunk_title": sample.get("chunk_title"),
+        "chunk_attempt": sample.get("chunk_attempt"),
+        "step_id": sample.get("step_id"),
+        "step_index": sample.get("step_index"),
+        "before_image_path": sample.get("before_image_path"),
+        "after_image_path": sample.get("after_image_path"),
+        "input_text": input_text,
+        "output_text": target_code,
+        "messages": [
+            {"role": "user", "content": input_text},
+            {"role": "assistant", "content": target_code},
+        ],
+        "metadata": {
+            "agent_run_label": sample.get("agent_run_label"),
+            "agent_run_dir": sample.get("agent_run_dir"),
+            "outcome": sample.get("outcome"),
+            "failure_type": sample.get("failure_type"),
+            "failure_text": sample.get("failure_text"),
+            "request_kind": sample.get("request_kind"),
+            "replan_requested": sample.get("replan_requested"),
+            "replan_reasons": sample.get("replan_reasons"),
+            "strong_visual_grounding": sample.get("strong_visual_grounding"),
+            "reasoning_enabled": sample.get("reasoning_enabled"),
+            "verification_contract_text": sample.get("verification_contract_text"),
+            "verification_result_text": sample.get("verification_result_text"),
+        },
+    }
+
+
 def append_run_artifacts(
     *,
     session_root: Path,
@@ -188,6 +405,7 @@ def append_run_artifacts(
 
     step_ids = sorted(set(request_map) | set(response_map) | set(executor_map), key=_step_sort_key)
     samples: list[dict] = []
+    train_samples: list[dict] = []
     for step_id in step_ids:
         request = request_map.get(step_id)
         response = response_map.get(step_id)
@@ -223,57 +441,66 @@ def append_run_artifacts(
         else:
             outcome = "fail"
 
-        samples.append(
-            {
-                "session_id": session_id,
-                "task": task,
-                "teacher_prompt": teacher_prompt,
-                "teacher_text": teacher_text,
-                "agent_prompt": agent_prompt,
-                "chunk_index": chunk_index,
-                "chunk_count": chunk_count,
-                "chunk_id": chunk_id,
-                "chunk_title": chunk_title,
-                "chunk_success_hint": chunk_success_hint,
-                "chunk_preconditions": chunk_preconditions,
-                "chunk_verification": chunk_verification,
-                "chunk_max_retries": chunk_max_retries,
-                "chunk_on_fail": chunk_on_fail,
-                "chunk_attempt": chunk_attempt,
-                "chunk_completed": chunk_completed,
-                "chunk_verification_result": chunk_verification_result,
-                "agent_run_label": agent_run_label,
-                "agent_run_dir": str(run_path),
-                "step_id": step_id,
-                "step_index": response.get("step_index") if isinstance(response, dict) else None,
-                "request_kind": request.get("request_kind") if isinstance(request, dict) else None,
-                "replan_requested": request.get("replan_requested") if isinstance(request, dict) else None,
-                "strong_visual_grounding": request.get("strong_visual_grounding") if isinstance(request, dict) else None,
-                "reasoning_enabled": request.get("reasoning_enabled") if isinstance(request, dict) else None,
-                "before_image_path": before_path,
-                "before_image_sha256": before_sha,
-                "after_image_path": after_path,
-                "after_image_sha256": after_sha,
-                "state_text": request.get("observation_text") if isinstance(request, dict) else None,
-                "recent_result": {
-                    "return_code": last_execution.get("return_code") if isinstance(last_execution, dict) else None,
-                    "stderr_tail": last_execution.get("stderr_tail") if isinstance(last_execution, dict) else None,
-                    "error_info": last_execution.get("error_info") if isinstance(last_execution, dict) else None,
-                },
-                "target_code": _resolved_target_code(response, executor),
-                "agent_raw_text": response.get("raw_text") if isinstance(response, dict) else None,
-                "agent_notes": response.get("notes") if isinstance(response, dict) else None,
-                "executor_stdout_tail": executor.get("stdout_tail") if isinstance(executor, dict) else None,
-                "executor_stderr_tail": executor.get("stderr_tail") if isinstance(executor, dict) else None,
-                "executor_error_info": executor.get("error_info") if isinstance(executor, dict) else None,
-                "return_code": return_code,
-                "outcome": outcome,
-                "failure_type": failure_type,
-                "failure_text": failure_text,
-            }
-        )
+        verification_contract_text = _verification_contract_text(chunk_verification)
+        verification_result_text = _verification_result_text(chunk_verification_result)
+
+        sample = {
+            "session_id": session_id,
+            "task": task,
+            "teacher_prompt": teacher_prompt,
+            "teacher_text": teacher_text,
+            "agent_prompt": agent_prompt,
+            "chunk_index": chunk_index,
+            "chunk_count": chunk_count,
+            "chunk_id": chunk_id,
+            "chunk_title": chunk_title,
+            "chunk_success_hint": chunk_success_hint,
+            "chunk_preconditions": chunk_preconditions,
+            "chunk_verification": chunk_verification,
+            "chunk_max_retries": chunk_max_retries,
+            "chunk_on_fail": chunk_on_fail,
+            "chunk_attempt": chunk_attempt,
+            "chunk_completed": chunk_completed,
+            "chunk_verification_result": chunk_verification_result,
+            "verification_contract_text": verification_contract_text,
+            "verification_result_text": verification_result_text,
+            "agent_run_label": agent_run_label,
+            "agent_run_dir": str(run_path),
+            "step_id": step_id,
+            "step_index": response.get("step_index") if isinstance(response, dict) else None,
+            "request_kind": request.get("request_kind") if isinstance(request, dict) else None,
+            "replan_requested": request.get("replan_requested") if isinstance(request, dict) else None,
+            "replan_reasons": request.get("replan_reasons") if isinstance(request, dict) else None,
+            "strong_visual_grounding": request.get("strong_visual_grounding") if isinstance(request, dict) else None,
+            "reasoning_enabled": request.get("reasoning_enabled") if isinstance(request, dict) else None,
+            "before_image_path": before_path,
+            "before_image_sha256": before_sha,
+            "after_image_path": after_path,
+            "after_image_sha256": after_sha,
+            "state_text": request.get("observation_text") if isinstance(request, dict) else None,
+            "recent_result": {
+                "return_code": last_execution.get("return_code") if isinstance(last_execution, dict) else None,
+                "stderr_tail": last_execution.get("stderr_tail") if isinstance(last_execution, dict) else None,
+                "error_info": last_execution.get("error_info") if isinstance(last_execution, dict) else None,
+            },
+            "target_code": _resolved_target_code(response, executor),
+            "agent_raw_text": response.get("raw_text") if isinstance(response, dict) else None,
+            "agent_notes": response.get("notes") if isinstance(response, dict) else None,
+            "executor_stdout_tail": executor.get("stdout_tail") if isinstance(executor, dict) else None,
+            "executor_stderr_tail": executor.get("stderr_tail") if isinstance(executor, dict) else None,
+            "executor_error_info": executor.get("error_info") if isinstance(executor, dict) else None,
+            "return_code": return_code,
+            "outcome": outcome,
+            "failure_type": failure_type,
+            "failure_text": failure_text,
+        }
+        samples.append(sample)
+        train_sample = _build_train_sample(sample)
+        if train_sample is not None:
+            train_samples.append(train_sample)
 
     _append_samples(session_root / "samples.jsonl", samples)
+    _append_samples(session_root / "train_samples.jsonl", train_samples)
     run_manifest = {
         "agent_run_label": agent_run_label,
         "chunk_index": chunk_index,
@@ -292,6 +519,7 @@ def append_run_artifacts(
         "agent_user_prompt": session_payload.get("user_prompt"),
         "policy": session_payload.get("policy"),
         "sample_count": len(samples),
+        "train_sample_count": len(train_samples),
         "loop_summary": loop_summary,
     }
     _write_json(session_root / "agent_runs" / f"{agent_run_label}.json", run_manifest)
@@ -356,6 +584,7 @@ def write_session_manifest(
         "chunk_results": chunk_results,
         "source_run_dirs": [item.get("source_run_dir") for item in run_manifests],
         "sample_count": sum(int(item.get("sample_count", 0)) for item in run_manifests),
+        "train_sample_count": sum(int(item.get("train_sample_count", 0)) for item in run_manifests),
         "run_count": len(run_manifests),
         "expected_chunk_count": len(teacher_chunks),
         "completed_chunk_count": sum(1 for item in chunk_results if bool(item.get("completed"))),
