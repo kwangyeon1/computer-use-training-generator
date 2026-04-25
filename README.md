@@ -81,6 +81,7 @@ cd /home/kss930/model-projects/gui-owl-8B-think-1.0.0/computer-use-training-gene
 - `agent_runs/*.verification.json`
 - `session.json`
 - `samples.jsonl`
+- `train_samples.jsonl`
 - `images/*.png`
 
 `samples.jsonl` 각 row는 대략 이런 형태입니다.
@@ -112,6 +113,8 @@ cd /home/kss930/model-projects/gui-owl-8B-think-1.0.0/computer-use-training-gene
       {"kind": "process_exists", "name": "chrome.exe", "exists": true, "passed": true}
     ]
   },
+  "verification_contract_text": "- Process `chrome.exe` must be running.",
+  "verification_result_text": "- process_exists: passed; process `chrome.exe`.",
   "step_id": "step-000",
   "request_kind": "generate",
   "before_image_path": "images/step-000.before.png",
@@ -121,6 +124,33 @@ cd /home/kss930/model-projects/gui-owl-8B-think-1.0.0/computer-use-training-gene
   "outcome": "success",
   "failure_type": null,
   "failure_text": null
+}
+```
+
+추가로 `train_samples.jsonl`도 같이 생성됩니다. 이 파일은 LoRA/SFT 전처리에 바로 쓰기 쉽게
+`agent_prompt`, verifier contract, observation, recent execution result를 하나의 `input_text`로 합치고,
+정답 Python을 `output_text`와 `messages` 형식으로 저장합니다.
+
+예시:
+
+```json
+{
+  "session_id": "20260406-...",
+  "task": "안드로이드 설치방법",
+  "chunk_id": "chunk-001",
+  "step_id": "step-000",
+  "before_image_path": "images/step-000.before.png",
+  "after_image_path": "images/step-000.after.png",
+  "input_text": "Task:\n...\n\nAgent Prompt:\n...\n\nVerifier Contract:\n...\n\nCurrent Observation:\n...\n\nReturn executable Python only.",
+  "output_text": "import ...",
+  "messages": [
+    {"role": "user", "content": "Task:\n..."},
+    {"role": "assistant", "content": "import ..."}
+  ],
+  "metadata": {
+    "verification_contract_text": "...",
+    "verification_result_text": "..."
+  }
 }
 ```
 

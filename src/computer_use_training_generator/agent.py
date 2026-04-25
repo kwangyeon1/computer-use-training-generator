@@ -36,6 +36,23 @@ def _format_command_failure(stage: str, result) -> str:
     return "\n".join(details)
 
 
+def _format_agent_error_response(response: dict, *, fallback: str = "agent run failed") -> str:
+    error = str(response.get("error") or "").strip()
+    error_type = str(response.get("error_type") or "").strip()
+    traceback_text = str(response.get("traceback") or "").strip()
+    if error_type and error:
+        message = f"{error_type}: {error}"
+    elif error_type:
+        message = error_type
+    elif error:
+        message = error
+    else:
+        message = fallback
+    if traceback_text:
+        return f"{message}\ntraceback:\n{traceback_text[-4000:]}"
+    return message
+
+
 def _base_agent_command(
     *,
     agent_command: str,
@@ -86,15 +103,39 @@ def _send_named_agent_daemon_request(agent_command: str, payload: dict, *, timeo
     temp_path.replace(request_path)
 
     started = time.monotonic()
+    last_decode_error: str | None = None
+    last_response_tail = ""
     while time.monotonic() - started < timeout_s:
         if response_path.exists():
             try:
-                return json.loads(response_path.read_text(encoding="utf-8"))
-            finally:
-                response_path.unlink(missing_ok=True)
-                request_path.unlink(missing_ok=True)
+                response_text = response_path.read_text(encoding="utf-8")
+            except OSError as exc:
+                last_decode_error = f"{type(exc).__name__}: {exc}"
+                time.sleep(0.05)
+                continue
+            if not response_text.strip():
+                last_decode_error = "empty response file"
+                time.sleep(0.05)
+                continue
+            try:
+                parsed = json.loads(response_text)
+            except json.JSONDecodeError as exc:
+                last_decode_error = f"{type(exc).__name__}: {exc}"
+                last_response_tail = response_text[-500:]
+                time.sleep(0.05)
+                continue
+            response_path.unlink(missing_ok=True)
+            request_path.unlink(missing_ok=True)
+            return parsed
         time.sleep(0.05)
     request_path.unlink(missing_ok=True)
+    if last_decode_error:
+        response_path.unlink(missing_ok=True)
+        tail = f"\nresponse_tail:\n{last_response_tail}" if last_response_tail else ""
+        raise RuntimeError(
+            f"raw agent daemon wrote an incomplete or invalid JSON response within {timeout_s}s: "
+            f"{last_decode_error}{tail}"
+        )
     raise RuntimeError(f"raw agent daemon did not respond within {timeout_s}s")
 
 
@@ -164,7 +205,7 @@ def run_agent_prompt(
         )
         duration_s = round(time.monotonic() - started, 3)
         if not response.get("ok", False):
-            raise RuntimeError(response.get("error", "agent run failed"))
+            raise RuntimeError(_format_agent_error_response(response, fallback="agent run failed"))
         summary = response.get("summary") or {}
         run_dir = summary.get("run_dir")
         if not run_dir:

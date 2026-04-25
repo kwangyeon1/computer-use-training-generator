@@ -2,12 +2,15 @@ from __future__ import annotations
 
 import argparse
 from dataclasses import asdict
+import hashlib
 import json
 import os
 from pathlib import Path
+import re
 import shutil
 import subprocess
 import sys
+import urllib.parse
 
 from .agent import bootstrap_agent, run_agent_prompt
 from .collector import (
@@ -21,7 +24,15 @@ from .collector import (
 )
 from .config_utils import load_generator_config
 from .models import TeacherChunkPlanResult, TeacherTaskChunk
-from .teacher import _task_staging_subdir, build_local_teacher_fallback, run_teacher, split_teacher_response
+from .teacher import (
+    _extract_link_candidate_urls,
+    _target_installer_keywords,
+    _task_staging_subdir,
+    build_local_teacher_fallback,
+    run_teacher_link_candidates,
+    run_teacher,
+    split_teacher_response,
+)
 from .verification import run_chunk_verification, write_verification_artifact
 
 
@@ -122,27 +133,154 @@ def _serialize_chunk(chunk: TeacherTaskChunk) -> dict:
         "notes": list(chunk.notes),
     }
 
+def _normalize_http_candidate_urls(urls: list[str] | None, *, limit: int = 5) -> list[str]:
+    cleaned: list[str] = []
+    seen: set[str] = set()
+    for raw_url in urls or []:
+        url = _strip_trailing_korean_particle_from_url_candidate(
+            str(raw_url or "").strip().rstrip(".,)`]>}\"'")
+        )
+        if not url.startswith(("http://", "https://")):
+            continue
+        lowered = url.lower()
+        if lowered in seen:
+            continue
+        seen.add(lowered)
+        cleaned.append(url)
+        if len(cleaned) >= limit:
+            break
+    return cleaned
 
-def _compose_chunk_prompt(chunk: TeacherTaskChunk, *, execution_style: str = "python_first") -> str:
+
+def _strip_trailing_korean_particle_from_url_candidate(candidate: str) -> str:
+    korean_particle_suffixes = (
+        "으로는",
+        "에서는",
+        "에게는",
+        "한테는",
+        "으로",
+        "에서",
+        "에게",
+        "한테",
+        "까지",
+        "부터",
+        "보다",
+        "처럼",
+        "라고",
+        "이라",
+        "라도",
+        "이다",
+        "은",
+        "는",
+        "이",
+        "가",
+        "을",
+        "를",
+        "에",
+        "와",
+        "과",
+        "도",
+    )
+    cleaned_candidate = str(candidate or "").strip()
+    for suffix in korean_particle_suffixes:
+        if not cleaned_candidate.endswith(suffix):
+            continue
+        stripped = cleaned_candidate[: -len(suffix)]
+        if not stripped:
+            continue
+        if re.search(r"[가-힣]$", stripped):
+            continue
+        try:
+            parsed = urllib.parse.urlparse(stripped)
+        except ValueError:
+            continue
+        if parsed.scheme in {"http", "https"} and parsed.netloc:
+            return stripped
+    return cleaned_candidate
+
+
+def _extract_http_urls(text: str, *, limit: int = 5) -> list[str]:
+    return _normalize_http_candidate_urls(
+        re.findall(r"https?://[^\s\"'<>]+", str(text or "")),
+        limit=limit,
+    )
+
+
+def _compose_explicit_open_target_block(candidate_urls: list[str] | None) -> str:
+    normalized = _normalize_http_candidate_urls(candidate_urls)
+    if not normalized:
+        return ""
+    url_lines = "\n".join(f"- {url}" for url in normalized)
+    return (
+        "Explicit open-target page URLs for this chunk. Treat these exact URLs as the primary runtime open targets "
+        "before any generic search, and open them in order:\n"
+        f"{url_lines}"
+    )
+
+
+def _normalize_source_task_text(source_task: str | None) -> str:
+    return re.sub(r"\s+", " ", str(source_task or "")).strip()
+
+
+def _source_task_prompt_key(source_task: str | None) -> str:
+    normalized = _normalize_source_task_text(source_task)
+    if not normalized:
+        return ""
+    basis = "source_task:" + normalized
+    return hashlib.sha256(basis.encode("utf-8")).hexdigest()[:24]
+
+
+def _compose_source_task_block(source_task: str | None) -> str:
+    normalized = _normalize_source_task_text(source_task)
+    if not normalized:
+        return ""
+    return f"Top-level source task for this run: {normalized}"
+
+
+def _attach_source_task_prompt_key(chunks: list[TeacherTaskChunk], *, source_task: str | None) -> None:
+    prompt_key = _source_task_prompt_key(source_task)
+    if not prompt_key:
+        return
+    for chunk in chunks:
+        verification = chunk.verification
+        if not isinstance(verification, dict):
+            continue
+        checks = verification.get("checks")
+        if not isinstance(checks, list):
+            continue
+        for check in checks:
+            if not isinstance(check, dict):
+                continue
+            if str(check.get("kind") or "").strip() not in {"json_marker_valid_installer", "json_marker_valid_exe"}:
+                continue
+            check["prompt_key"] = prompt_key
+
+
+def _compose_chunk_prompt(
+    chunk: TeacherTaskChunk,
+    *,
+    execution_style: str = "python_first",
+    candidate_urls: list[str] | None = None,
+    source_task: str | None = None,
+) -> str:
     normalized_style = _normalize_execution_style(execution_style)
     if normalized_style == "gui_first":
         prefix = (
-            "Return executable Python only for this chunk. Prefer continuing from the currently visible browser, "
-            "search results, download UI, app window, or installer dialog when that UI is already on screen. "
-            "Do not ask a human to perform manual GUI actions outside the generated Python. "
-            "If grounded visible browser/download/installer UI is already available, do not switch to fresh direct HTTP fetching, "
-            "HTML scraping, or silent-install shortcuts in the same step unless the latest execution proves that UI path stalled. "
-            "If a visible download-like or installer-like control is on screen, prefer OCR-grounded helpers such as "
-            "`click_download_like_target()` or `click_text_targets([...])` before new network-fetch logic. "
-            "If the page looks like a collapsed or responsive header menu layout and the download control is not visible yet, "
-            "prefer `open_responsive_header_menu()` before fresh network discovery."
+            "Return executable Python only for this chunk. Continue from the currently visible browser, download UI, "
+            "app window, or installer dialog when that state is already on screen. Use screenshot-grounded page-content "
+            "actions first, avoid toolbar/address/tab/bookmark/blank-margin clicks, and do not ask a human to take manual GUI actions."
         )
     else:
         prefix = (
             "Return executable Python only for this chunk. Do not ask a human to perform manual GUI actions "
             "outside the generated Python."
         )
-    parts = [prefix, chunk.agent_prompt.strip()]
+    parts = [
+        prefix,
+        _compose_source_task_block(source_task),
+        _compose_explicit_open_target_block(candidate_urls),
+        chunk.agent_prompt.strip(),
+    ]
     if chunk.success_hint:
         parts.append(f"Current chunk success target: {chunk.success_hint}")
     if chunk.preconditions:
@@ -160,15 +298,24 @@ def _extract_verified_installer_paths(verification_result: dict | None) -> list[
     for entry in evidence:
         if not isinstance(entry, dict):
             continue
+        if entry.get("passed") is False:
+            continue
+        keywords = [str(item).strip().lower() for item in (entry.get("keywords") or []) if str(item).strip()]
+        keyword_hits = [str(item).strip().lower() for item in (entry.get("keyword_hits") or []) if str(item).strip()]
+        if keywords and not keyword_hits:
+            continue
         kind = str(entry.get("kind") or "")
-        if kind not in {"path_exists", "file_exists_glob", "file_size_gt"}:
+        if kind not in {"path_exists", "file_exists_glob", "file_size_gt", "json_marker_valid_installer"}:
             continue
         candidates: list[str] = []
         path_value = str(entry.get("path") or "").strip()
         pattern_value = str(entry.get("pattern") or "").strip()
+        resolved_path_value = str(entry.get("resolved_path") or "").strip()
         if path_value:
             candidates.append(path_value)
-        if pattern_value.endswith(".exe") and "*" not in pattern_value:
+        if resolved_path_value:
+            candidates.append(resolved_path_value)
+        if pattern_value.lower().endswith((".exe", ".msi")) and "*" not in pattern_value:
             candidates.append(pattern_value)
         matches = entry.get("matches") or []
         if isinstance(matches, list):
@@ -181,7 +328,7 @@ def _extract_verified_installer_paths(verification_result: dict | None) -> list[
                     candidates.append(candidate)
         for candidate in candidates:
             normalized = candidate.replace("\\", "/").rstrip()
-            if not normalized.lower().endswith(".exe"):
+            if not normalized.lower().endswith((".exe", ".msi")):
                 continue
             lowered = normalized.lower()
             if lowered in seen:
@@ -211,18 +358,335 @@ def _compose_retry_prompt(
     attempt_index: int,
     execution_style: str = "python_first",
     prior_verification_result: dict | None = None,
+    candidate_urls: list[str] | None = None,
+    source_task: str | None = None,
 ) -> str:
     evidence = verification_result.get("evidence")
     error = verification_result.get("error")
     evidence_text = json.dumps(evidence, ensure_ascii=False, indent=2) if evidence else "[]"
     retry_header = f"Previous attempt {attempt_index} did not satisfy the chunk verifier. Retry only this chunk."
     details = [retry_header]
+    normalized_style = _normalize_execution_style(execution_style)
     if error:
         details.append(f"Verifier error: {error}")
     details.append(f"Verifier evidence:\n{evidence_text}")
-    prompt_text = _compose_chunk_prompt(chunk, execution_style=execution_style)
+    if normalized_style == "gui_first":
+        retry_target_keywords = _target_installer_keywords(
+            chunk.title,
+            chunk.agent_prompt,
+            chunk.success_hint or "",
+            *chunk.preconditions,
+            limit=6,
+        )
+        details.append(
+            "GUI-first retry rule: if the browser page for this chunk is already visible, stay on that same page/tab first. "
+            "Do not guess a new direct installer URL before exhausting the visible page-content path."
+        )
+        details.append(
+            "For a download chunk, end only when the installer file exists on disk with a plausible size. "
+            "Do not launch or silently install the installer in this chunk."
+        )
+        details.append(
+            "If one visible coordinate candidate does not progress, try a different visible page-content candidate in the same script. "
+            "Do not use browser toolbar/address/tab/bookmark areas as click targets."
+        )
+        if retry_target_keywords:
+            details.append(
+                "If you must abandon the current page and run a new browser search, keep these exact task/product keywords in the query: "
+                + ", ".join(retry_target_keywords)
+                + "."
+            )
+            details.append(
+                "Do not replace those task/product keywords with generic retry wording, verifier artifact names, or unrelated product names."
+            )
+    if candidate_urls:
+        details.append(
+            "Use the explicit open-target URLs listed above before generic search, but still verify that the visible "
+            "page and download result match this chunk target."
+        )
+    prompt_text = _compose_chunk_prompt(
+        chunk,
+        execution_style=execution_style,
+        candidate_urls=candidate_urls,
+        source_task=source_task,
+    )
     prompt_text = _append_verified_installer_hint(prompt_text, prior_verification_result)
     return prompt_text + "\n\n" + "\n\n".join(details)
+
+
+def _chunk_looks_like_download_retry(chunk: TeacherTaskChunk) -> bool:
+    combined = " ".join(
+        str(part or "")
+        for part in (
+            chunk.title,
+            chunk.agent_prompt,
+            chunk.success_hint,
+            json.dumps(chunk.verification or {}, ensure_ascii=False),
+        )
+    ).lower()
+    return any(token in combined for token in ("download", "다운로드", "installer", "설치파일", ".exe", ".msi"))
+
+
+def _teacher_link_candidate_urls_from_result(result_text: str) -> list[str]:
+    try:
+        payload = json.loads(result_text)
+    except json.JSONDecodeError:
+        return []
+    urls = payload.get("candidate_urls")
+    if not isinstance(urls, list):
+        return []
+    cleaned: list[str] = []
+    seen: set[str] = set()
+    for raw_url in urls:
+        url = str(raw_url or "").strip()
+        if not url.startswith(("http://", "https://")):
+            continue
+        if url in seen:
+            continue
+        seen.add(url)
+        cleaned.append(url)
+    return cleaned
+
+
+def _initial_chunk_candidate_urls(
+    *,
+    task: str,
+    chunk: TeacherTaskChunk,
+    teacher_text: str | None = None,
+    teacher_plan_source_text: str | None = None,
+    limit: int = 5,
+) -> list[str]:
+    candidates: list[str] = []
+    seen: set[str] = set()
+
+    def _add(urls: list[str]) -> None:
+        for url in _normalize_http_candidate_urls(urls, limit=limit):
+            lowered = url.lower()
+            if lowered in seen:
+                continue
+            seen.add(lowered)
+            candidates.append(url)
+            if len(candidates) >= limit:
+                return
+
+    for text in (task, chunk.agent_prompt):
+        _add(_extract_http_urls(text, limit=limit))
+        if len(candidates) >= limit:
+            return candidates
+
+    for text in (teacher_text or "", teacher_plan_source_text or ""):
+        _add(_extract_link_candidate_urls(text, task=task, limit=limit))
+        if len(candidates) >= limit:
+            return candidates
+        _add(_extract_http_urls(text, limit=limit))
+        if len(candidates) >= limit:
+            return candidates
+    return candidates
+
+
+_RETRY_EXCLUSION_URL_RE = re.compile(r"https?://[^\s\"'<>]+")
+_RETRY_EXCLUSION_SEARCH_HOST_TOKENS = (
+    "google.",
+    "bing.",
+    "duckduckgo.",
+    "yahoo.",
+    "naver.",
+    "daum.",
+)
+_RETRY_EXCLUSION_STRING_KEYS = frozenset(
+    {
+        "executed_python_code",
+        "python_code",
+        "raw_text",
+        "stdout_tail",
+        "stderr_tail",
+    }
+)
+
+
+def _extract_retry_exclusion_urls_and_queries(text: str, *, limit: int = 8) -> tuple[list[str], list[str]]:
+    urls: list[str] = []
+    queries: list[str] = []
+    seen_urls: set[str] = set()
+    seen_queries: set[str] = set()
+    for raw_url in _RETRY_EXCLUSION_URL_RE.findall(str(text or "")):
+        url = str(raw_url or "").strip().rstrip(".,)")
+        if not url:
+            continue
+        try:
+            parsed = urllib.parse.urlparse(url)
+        except ValueError:
+            continue
+        if parsed.scheme not in {"http", "https"} or not parsed.netloc:
+            continue
+        host = str(parsed.netloc or "").lower()
+        if any(token in host for token in _RETRY_EXCLUSION_SEARCH_HOST_TOKENS):
+            query_values = urllib.parse.parse_qs(str(parsed.query or ""), keep_blank_values=False).get("q") or []
+            for raw_query in query_values:
+                query = re.sub(r"\s+", " ", urllib.parse.unquote_plus(str(raw_query or "")).strip())
+                if not query or query in seen_queries:
+                    continue
+                seen_queries.add(query)
+                queries.append(query)
+                if len(queries) >= limit:
+                    break
+            continue
+        if url in seen_urls:
+            continue
+        seen_urls.add(url)
+        urls.append(url)
+        if len(urls) >= limit:
+            continue
+    return urls[:limit], queries[:limit]
+
+
+def _iter_retry_exclusion_strings(payload) -> list[str]:
+    snippets: list[str] = []
+    stack = [payload]
+    while stack:
+        current = stack.pop()
+        if isinstance(current, dict):
+            for key, value in current.items():
+                if isinstance(value, str) and key in _RETRY_EXCLUSION_STRING_KEYS:
+                    snippets.append(value)
+                elif isinstance(value, (dict, list)):
+                    stack.append(value)
+        elif isinstance(current, list):
+            stack.extend(current)
+    return snippets
+
+
+def _collect_retry_link_request_exclusions(
+    *,
+    session_root: Path,
+    retry_agent_run_label: str,
+    limit: int = 8,
+) -> tuple[list[str], list[str]]:
+    agent_runs_dir = session_root / "agent_runs"
+    chunk_prefix = retry_agent_run_label.split(".attempt-", 1)[0]
+    excluded_urls: list[str] = []
+    excluded_queries: list[str] = []
+    seen_urls: set[str] = set()
+    seen_queries: set[str] = set()
+
+    def _append(urls: list[str], queries: list[str]) -> None:
+        for url in urls:
+            if url in seen_urls:
+                continue
+            seen_urls.add(url)
+            excluded_urls.append(url)
+            if len(excluded_urls) >= limit:
+                break
+        for query in queries:
+            if query in seen_queries:
+                continue
+            seen_queries.add(query)
+            excluded_queries.append(query)
+            if len(excluded_queries) >= limit:
+                break
+
+    for artifact_path in sorted(agent_runs_dir.glob(f"{chunk_prefix}.attempt-*.json")):
+        name = artifact_path.name
+        if name.endswith((".prompt.json", ".verification.json", ".teacher_link_candidates.json")):
+            continue
+        try:
+            payload = json.loads(artifact_path.read_text(encoding="utf-8"))
+        except Exception:
+            try:
+                snippets = [artifact_path.read_text(encoding="utf-8", errors="ignore")]
+            except OSError:
+                continue
+        else:
+            snippets = _iter_retry_exclusion_strings(payload)
+        collected_urls: list[str] = []
+        collected_queries: list[str] = []
+        for snippet in snippets:
+            urls, queries = _extract_retry_exclusion_urls_and_queries(snippet, limit=limit)
+            collected_urls.extend(urls)
+            collected_queries.extend(queries)
+        _append(collected_urls, collected_queries)
+
+    for artifact_path in sorted(agent_runs_dir.glob(f"{chunk_prefix}.attempt-*.teacher_link_candidates.json")):
+        try:
+            payload = json.loads(artifact_path.read_text(encoding="utf-8"))
+        except Exception:
+            continue
+        raw_urls = payload.get("candidate_urls")
+        if not isinstance(raw_urls, list):
+            continue
+        teacher_urls: list[str] = []
+        for raw_url in raw_urls:
+            url = str(raw_url or "").strip()
+            if not url.startswith(("http://", "https://")):
+                continue
+            teacher_urls.append(url)
+        _append(teacher_urls, [])
+
+    return excluded_urls[:limit], excluded_queries[:limit]
+
+
+def _request_teacher_retry_link_candidates(
+    *,
+    task: str,
+    chunk: TeacherTaskChunk,
+    verification_result: dict | None,
+    teacher_command_template: str,
+    teacher_workdir: str | None,
+    teacher_timeout_s: float,
+    session_root: Path,
+    agent_run_label: str,
+    execution_style: str,
+) -> list[str]:
+    if _normalize_execution_style(execution_style) != "gui_first":
+        return []
+    if not _chunk_looks_like_download_retry(chunk):
+        return []
+    if not str(teacher_command_template or "").strip():
+        return []
+    excluded_candidate_urls, excluded_search_queries = _collect_retry_link_request_exclusions(
+        session_root=session_root,
+        retry_agent_run_label=agent_run_label,
+    )
+    failure_context = json.dumps(verification_result or {}, ensure_ascii=False, indent=2)
+    try:
+        result = run_teacher_link_candidates(
+            task=task,
+            chunk_title=chunk.title,
+            chunk_prompt=chunk.agent_prompt,
+            failure_context=failure_context,
+            command_template=teacher_command_template,
+            cwd=teacher_workdir,
+            timeout_s=min(max(float(teacher_timeout_s), 30.0), 180.0),
+            limit=5,
+            failed_candidate_urls=excluded_candidate_urls,
+            failed_search_queries=excluded_search_queries,
+        )
+    except Exception as exc:
+        payload = {
+            "ok": False,
+            "error": str(exc),
+            "candidate_urls": [],
+            "excluded_candidate_urls": excluded_candidate_urls,
+            "excluded_search_queries": excluded_search_queries,
+        }
+        path = session_root / "agent_runs" / f"{agent_run_label}.teacher_link_candidates.json"
+        path.parent.mkdir(parents=True, exist_ok=True)
+        path.write_text(json.dumps(payload, ensure_ascii=False, indent=2), encoding="utf-8")
+        return []
+    candidate_urls = _teacher_link_candidate_urls_from_result(result.response_text)
+    payload = {
+        "ok": True,
+        "teacher_prompt": result.prompt,
+        "teacher_response": result.response_text,
+        "candidate_urls": candidate_urls,
+        "excluded_candidate_urls": excluded_candidate_urls,
+        "excluded_search_queries": excluded_search_queries,
+        "command_result": asdict(result.command_result),
+    }
+    path = session_root / "agent_runs" / f"{agent_run_label}.teacher_link_candidates.json"
+    path.parent.mkdir(parents=True, exist_ok=True)
+    path.write_text(json.dumps(payload, ensure_ascii=False, indent=2), encoding="utf-8")
+    return candidate_urls
 
 
 def _teacher_execution_style_context(execution_style: str) -> str:
@@ -232,12 +696,17 @@ def _teacher_execution_style_context(execution_style: str) -> str:
             "Plan for GUI-first automation. The agent still returns executable Python only, but when the current "
             "screenshot already shows a browser page, search results, a download control, an installer wizard, a UAC "
             "prompt, or an app window, prefer advancing that visible UI state before replacing it with a fresh direct "
-            "download or silent-install shortcut."
+            "download or silent-install shortcut. For desktop software installation tasks, do not route through "
+            "Microsoft Store, app stores, winget, package managers, or app-store web listings unless the user "
+            "explicitly requests that source; prefer a relevant vendor, product, or download page and a Windows "
+            "`.exe`/`.msi` installer when one is available."
         )
     return (
-        "Plan for Python-first automation. Prefer deterministic Python flows such as direct official URL download, "
+        "Plan for Python-first automation. Prefer deterministic Python flows such as direct URL download, "
         "file verification in Downloads, subprocess-based installer launch, and Python GUI automation only for the "
-        "remaining dialogs."
+        "remaining dialogs. For desktop software installation tasks, do not route through Microsoft Store, app "
+        "stores, winget, package managers, or app-store web listings unless the user explicitly requests that source; "
+        "prefer a relevant vendor, product, or download page and a Windows `.exe`/`.msi` installer when one is available."
     )
 
 
@@ -245,6 +714,56 @@ def _chunk_completed_from_agent_payload(payload: dict) -> bool:
     summary = payload.get("summary") or {}
     final_response = summary.get("final_response") or {}
     return bool(final_response.get("done")) or str(summary.get("stopped_reason") or "") == "task_completed"
+
+
+def _task_requests_post_install_launch(task: str) -> bool:
+    lowered = str(task or "").lower()
+    return any(
+        token in lowered
+        for token in (
+            "launch",
+            "run",
+            "open",
+            "start",
+            "execute",
+            "실행",
+            "열어",
+            "켜줘",
+            "시작",
+        )
+    )
+
+
+def _should_stop_after_install_completion(task: str, chunk: TeacherTaskChunk) -> bool:
+    if _task_requests_post_install_launch(task):
+        return False
+    task_text = str(task or "").lower()
+    if not any(token in task_text for token in ("install", "installer", "setup", "설치")):
+        return False
+    chunk_text = " ".join(
+        str(value or "").lower()
+        for value in (
+            chunk.title,
+            chunk.success_hint,
+            chunk.agent_prompt,
+        )
+    )
+    if any(token in chunk_text for token in ("download installer", "download-only", "다운로드")) and not any(
+        token in chunk_text for token in ("run installer", "launch the downloaded", "설치 파일을 실행", "installer finishes")
+    ):
+        return False
+    install_markers = (
+        "run installer",
+        "launch the downloaded",
+        "complete setup",
+        "installer finishes",
+        "is installed",
+        "installed on the machine",
+        "설치 파일을 실행",
+        "설치 완료",
+        "설치가 완료",
+    )
+    return any(marker in chunk_text for marker in install_markers)
 
 
 def _compose_teacher_prompt(*, task: str, config: dict) -> str:
@@ -433,6 +952,7 @@ def cmd_run_session(args: argparse.Namespace) -> int:
             execution_style=execution_style,
             staging_subdir=local_fallback_staging_subdir,
         )
+    _attach_source_task_prompt_key(teacher_plan.chunks, source_task=teacher_plan.source_task or args.task)
     write_teacher_bundle(
         session_root=session_root,
         teacher_prompt=teacher_prompt,
@@ -481,6 +1001,7 @@ def cmd_run_session(args: argparse.Namespace) -> int:
     chunk_results: list[dict] = []
     total_chunks = len(teacher_plan.chunks)
     stopped_reason: str | None = None
+    install_completion_reached = False
     chunk_verification_enabled = bool(config.get("chunk_verification_enabled", True))
     previous_chunk_verification_result: dict | None = None
     for chunk_index, chunk in enumerate(teacher_plan.chunks, start=1):
@@ -490,6 +1011,12 @@ def cmd_run_session(args: argparse.Namespace) -> int:
         final_run_label: str | None = None
         final_run_dir: str | None = None
         attempts_used = 0
+        initial_candidate_urls = _initial_chunk_candidate_urls(
+            task=args.task,
+            chunk=chunk,
+            teacher_text=teacher_result.response_text,
+            teacher_plan_source_text=teacher_plan.source_text,
+        )
         if chunk_verification_enabled:
             precheck_label = f"chunk-{chunk_index:03d}.precheck"
             precheck_result_obj = run_chunk_verification(
@@ -514,15 +1041,34 @@ def cmd_run_session(args: argparse.Namespace) -> int:
             if chunk_completed:
                 break
             attempts_used += 1
-            prompt_text = _compose_chunk_prompt(chunk, execution_style=execution_style)
+            prompt_text = _compose_chunk_prompt(
+                chunk,
+                execution_style=execution_style,
+                candidate_urls=initial_candidate_urls,
+                source_task=teacher_plan.source_task or args.task,
+            )
             prompt_text = _append_verified_installer_hint(prompt_text, previous_chunk_verification_result)
             if attempt_index > 0 and final_verification_result is not None:
+                retry_agent_run_label = f"chunk-{chunk_index:03d}.attempt-{attempt_index + 1:02d}"
+                retry_candidate_urls = _request_teacher_retry_link_candidates(
+                    task=args.task,
+                    chunk=chunk,
+                    verification_result=final_verification_result,
+                    teacher_command_template=teacher_command_template,
+                    teacher_workdir=teacher_workdir,
+                    teacher_timeout_s=float(config.get("teacher_split_timeout_s", teacher_timeout_s)),
+                    session_root=session_root,
+                    agent_run_label=retry_agent_run_label,
+                    execution_style=execution_style,
+                )
                 prompt_text = _compose_retry_prompt(
                     chunk=chunk,
                     verification_result=final_verification_result,
                     attempt_index=attempt_index,
                     execution_style=execution_style,
                     prior_verification_result=previous_chunk_verification_result,
+                    candidate_urls=retry_candidate_urls or initial_candidate_urls,
+                    source_task=teacher_plan.source_task or args.task,
                 )
             prompt_result = run_agent_prompt(
                 agent_command=str(config["agent_command"]),
@@ -619,10 +1165,15 @@ def cmd_run_session(args: argparse.Namespace) -> int:
         )
         if not chunk_completed:
             break
+        if _should_stop_after_install_completion(args.task, chunk):
+            install_completion_reached = True
+            stopped_reason = "install_completed"
+            break
         previous_chunk_verification_result = final_verification_result
 
     completed_chunks = len(chunk_results)
-    for remaining_index, chunk in enumerate(teacher_plan.chunks[completed_chunks:], start=completed_chunks + 1):
+    remaining_chunks = [] if install_completion_reached else teacher_plan.chunks[completed_chunks:]
+    for remaining_index, chunk in enumerate(remaining_chunks, start=completed_chunks + 1):
         chunk_results.append(
             {
                 "chunk_index": remaining_index,
