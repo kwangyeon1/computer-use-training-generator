@@ -79,6 +79,9 @@ def _normalize_verification_spec(verification: dict[str, object] | None) -> dict
             field = str(item.get("field") or default_field).strip() or default_field
             normalized["path"] = path
             normalized["field"] = field
+            prompt_key = str(item.get("prompt_key") or "").strip()
+            if prompt_key:
+                normalized["prompt_key"] = prompt_key
             if kind == "json_marker_valid_installer":
                 try:
                     normalized["bytes"] = max(0, int(item.get("bytes") or 0))
@@ -342,7 +345,7 @@ def _looks_like_invalid_exe_path(path_text):
     return False
 
 
-def _validate_json_marker_exe(marker_path, field, keywords):
+def _validate_json_marker_exe(marker_path, field, keywords, expected_prompt_key=None):
     expanded_marker = os.path.expanduser(str(marker_path or ""))
     marker = Path(expanded_marker)
     entry = {{
@@ -358,7 +361,21 @@ def _validate_json_marker_exe(marker_path, field, keywords):
     except Exception as exc:
         entry["error"] = f"invalid_json: {{exc}}"
         return False, entry
-    raw_candidate = str((payload or {{}}).get(field) or "").strip().strip('"')
+    if not isinstance(payload, dict):
+        payload = {{}}
+    expected_prompt_key = str(expected_prompt_key or "").strip()
+    stored_prompt_key = str(payload.get("prompt_key") or "").strip()
+    if expected_prompt_key:
+        entry["expected_prompt_key"] = expected_prompt_key
+        entry["stored_prompt_key"] = stored_prompt_key
+        strict_prompt_key = marker.name.lower() == "computer-use-agent-context.json"
+        if stored_prompt_key and stored_prompt_key != expected_prompt_key:
+            entry["error"] = "prompt_key_mismatch"
+            return False, entry
+        if strict_prompt_key and not stored_prompt_key:
+            entry["error"] = "missing_prompt_key"
+            return False, entry
+    raw_candidate = str(payload.get(field) or "").strip().strip('"')
     entry["value"] = raw_candidate
     if not raw_candidate:
         entry["error"] = "missing_field_value"
@@ -434,7 +451,7 @@ def _fallback_installer_candidates(keywords, min_bytes, allowed_suffixes):
     return [item[3] for item in candidates]
 
 
-def _validate_json_marker_installer(marker_path, field, keywords, min_bytes, allowed_suffixes):
+def _validate_json_marker_installer(marker_path, field, keywords, min_bytes, allowed_suffixes, expected_prompt_key=None):
     expanded_marker = os.path.expanduser(str(marker_path or ""))
     marker = Path(expanded_marker)
     entry = {{
@@ -452,6 +469,18 @@ def _validate_json_marker_installer(marker_path, field, keywords, min_bytes, all
         return False, entry
     if not isinstance(payload, dict):
         payload = {{}}
+    expected_prompt_key = str(expected_prompt_key or "").strip()
+    stored_prompt_key = str(payload.get("prompt_key") or "").strip()
+    if expected_prompt_key:
+        entry["expected_prompt_key"] = expected_prompt_key
+        entry["stored_prompt_key"] = stored_prompt_key
+        strict_prompt_key = marker.name.lower() == "computer-use-agent-context.json"
+        if stored_prompt_key and stored_prompt_key != expected_prompt_key:
+            entry["error"] = "prompt_key_mismatch"
+            return False, entry
+        if strict_prompt_key and not stored_prompt_key:
+            entry["error"] = "missing_prompt_key"
+            return False, entry
     marker_keywords = payload.get("target_keywords") or []
     if not isinstance(marker_keywords, list):
         marker_keywords = []
@@ -473,6 +502,7 @@ def _validate_json_marker_installer(marker_path, field, keywords, min_bytes, all
     normalized_keywords = _normalize_keywords(keywords)
     source_url = str(payload.get("source_url") or "")
     candidate_keyword_haystack = str(candidate).lower()
+    candidate_name_haystack = str(candidate.name).lower()
     context_haystack = " ".join(
         [
             candidate_keyword_haystack,
@@ -483,11 +513,62 @@ def _validate_json_marker_installer(marker_path, field, keywords, min_bytes, all
     keyword_hits = [keyword for keyword in normalized_keywords if keyword in candidate_keyword_haystack]
     marker_keyword_haystack = " ".join(str(item).lower() for item in marker_keywords)
     marker_keyword_hits = [keyword for keyword in normalized_keywords if keyword in marker_keyword_haystack]
+    alias_context_tokens = []
+    for raw_token in list(marker_keywords) + [source_url]:
+        for token in re.findall(r"[a-z0-9가-힣][a-z0-9가-힣._-]{1,}", str(raw_token or "").lower()):
+            cleaned = token.strip("._-")
+            if (
+                not cleaned
+                or cleaned in alias_context_tokens
+                or cleaned in normalized_keywords
+                or cleaned in SYSTEM_APP_NAMES
+                or cleaned in {
+                    "http",
+                    "https",
+                    "www",
+                    "com",
+                    "net",
+                    "org",
+                    "kr",
+                    "ko",
+                    "kor",
+                    "korea",
+                    "windows",
+                    "download",
+                    "downloads",
+                    "install",
+                    "installer",
+                    "setup",
+                    "official",
+                    "source",
+                    "target",
+                    "keywords",
+                    "irrelevant",
+                    "guessed",
+                    "tab",
+                    "stay",
+                    "page",
+                    "pages",
+                    "vendor",
+                    "product",
+                    "browser",
+                    "visible",
+                    "current",
+                }
+            ):
+                continue
+            if cleaned.isdigit() or re.fullmatch(r"v?\d+(?:\.\d+)*", cleaned):
+                continue
+            if re.search(r"[가-힣]", cleaned) is None and len(cleaned) < 4:
+                continue
+            alias_context_tokens.append(cleaned)
+    alias_keyword_hits = [token for token in alias_context_tokens if token in candidate_name_haystack]
     entry["keywords"] = normalized_keywords
     entry["marker_target_keywords"] = marker_keywords
     entry["source_url"] = source_url
     entry["keyword_hits"] = keyword_hits
     entry["marker_keyword_hits"] = marker_keyword_hits
+    entry["alias_keyword_hits"] = alias_keyword_hits
     normalized_allowed_suffixes = []
     for suffix in allowed_suffixes or [".exe", ".msi"]:
         lowered = str(suffix or "").strip().lower()
@@ -500,11 +581,16 @@ def _validate_json_marker_installer(marker_path, field, keywords, min_bytes, all
     if not normalized_allowed_suffixes:
         normalized_allowed_suffixes = [".exe", ".msi"]
     entry["allowed_suffixes"] = normalized_allowed_suffixes
-    # The marker can be stale or polluted, so target_keywords/source_url are only
-    # evidence. The completed artifact path itself must match the verifier's task
-    # keywords when keywords are provided.
-    keyword_ok = not normalized_keywords or bool(keyword_hits)
-    if normalized_keywords and not keyword_hits:
+    # The marker can be stale or polluted, so path keyword matches stay primary.
+    # As a narrow bridge for vendor-specific filenames, allow marker/source alias
+    # keywords only when the original verifier keyword matched marker metadata and
+    # the actual installer filename also matches a filtered alias token.
+    keyword_ok = (
+        not normalized_keywords
+        or bool(keyword_hits)
+        or (bool(marker_keyword_hits) and bool(alias_keyword_hits))
+    )
+    if normalized_keywords and not keyword_hits and not (marker_keyword_hits and alias_keyword_hits):
         entry["error"] = "installer_path_keyword_mismatch"
     portable_ok = "portable" not in context_haystack or any("portable" in keyword for keyword in normalized_keywords)
     ok = (
@@ -563,7 +649,8 @@ for check in CHECKS:
         path = str(check.get("path") or "")
         field = str(check.get("field") or "installed_exe")
         keywords = check.get("keywords") or []
-        ok, marker_entry = _validate_json_marker_exe(path, field, keywords)
+        prompt_key = str(check.get("prompt_key") or "")
+        ok, marker_entry = _validate_json_marker_exe(path, field, keywords, prompt_key)
         entry.update(marker_entry)
     elif kind == "json_marker_valid_installer":
         path = str(check.get("path") or "")
@@ -571,7 +658,8 @@ for check in CHECKS:
         keywords = check.get("keywords") or []
         min_bytes = int(check.get("bytes") or 0)
         allowed_suffixes = check.get("allowed_suffixes") or []
-        ok, marker_entry = _validate_json_marker_installer(path, field, keywords, min_bytes, allowed_suffixes)
+        prompt_key = str(check.get("prompt_key") or "")
+        ok, marker_entry = _validate_json_marker_installer(path, field, keywords, min_bytes, allowed_suffixes, prompt_key)
         entry.update(marker_entry)
     else:
         entry["error"] = "unsupported_check_kind"

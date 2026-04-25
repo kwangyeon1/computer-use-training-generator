@@ -2,6 +2,7 @@ from __future__ import annotations
 
 import argparse
 from dataclasses import asdict
+import hashlib
 import json
 import os
 from pathlib import Path
@@ -136,7 +137,9 @@ def _normalize_http_candidate_urls(urls: list[str] | None, *, limit: int = 5) ->
     cleaned: list[str] = []
     seen: set[str] = set()
     for raw_url in urls or []:
-        url = _strip_trailing_korean_particle_from_url_candidate(str(raw_url or "").strip().rstrip(".,)"))
+        url = _strip_trailing_korean_particle_from_url_candidate(
+            str(raw_url or "").strip().rstrip(".,)`]>}\"'")
+        )
         if not url.startswith(("http://", "https://")):
             continue
         lowered = url.lower()
@@ -215,11 +218,50 @@ def _compose_explicit_open_target_block(candidate_urls: list[str] | None) -> str
     )
 
 
+def _normalize_source_task_text(source_task: str | None) -> str:
+    return re.sub(r"\s+", " ", str(source_task or "")).strip()
+
+
+def _source_task_prompt_key(source_task: str | None) -> str:
+    normalized = _normalize_source_task_text(source_task)
+    if not normalized:
+        return ""
+    basis = "source_task:" + normalized
+    return hashlib.sha256(basis.encode("utf-8")).hexdigest()[:24]
+
+
+def _compose_source_task_block(source_task: str | None) -> str:
+    normalized = _normalize_source_task_text(source_task)
+    if not normalized:
+        return ""
+    return f"Top-level source task for this run: {normalized}"
+
+
+def _attach_source_task_prompt_key(chunks: list[TeacherTaskChunk], *, source_task: str | None) -> None:
+    prompt_key = _source_task_prompt_key(source_task)
+    if not prompt_key:
+        return
+    for chunk in chunks:
+        verification = chunk.verification
+        if not isinstance(verification, dict):
+            continue
+        checks = verification.get("checks")
+        if not isinstance(checks, list):
+            continue
+        for check in checks:
+            if not isinstance(check, dict):
+                continue
+            if str(check.get("kind") or "").strip() not in {"json_marker_valid_installer", "json_marker_valid_exe"}:
+                continue
+            check["prompt_key"] = prompt_key
+
+
 def _compose_chunk_prompt(
     chunk: TeacherTaskChunk,
     *,
     execution_style: str = "python_first",
     candidate_urls: list[str] | None = None,
+    source_task: str | None = None,
 ) -> str:
     normalized_style = _normalize_execution_style(execution_style)
     if normalized_style == "gui_first":
@@ -233,7 +275,12 @@ def _compose_chunk_prompt(
             "Return executable Python only for this chunk. Do not ask a human to perform manual GUI actions "
             "outside the generated Python."
         )
-    parts = [prefix, _compose_explicit_open_target_block(candidate_urls), chunk.agent_prompt.strip()]
+    parts = [
+        prefix,
+        _compose_source_task_block(source_task),
+        _compose_explicit_open_target_block(candidate_urls),
+        chunk.agent_prompt.strip(),
+    ]
     if chunk.success_hint:
         parts.append(f"Current chunk success target: {chunk.success_hint}")
     if chunk.preconditions:
@@ -312,6 +359,7 @@ def _compose_retry_prompt(
     execution_style: str = "python_first",
     prior_verification_result: dict | None = None,
     candidate_urls: list[str] | None = None,
+    source_task: str | None = None,
 ) -> str:
     evidence = verification_result.get("evidence")
     error = verification_result.get("error")
@@ -360,6 +408,7 @@ def _compose_retry_prompt(
         chunk,
         execution_style=execution_style,
         candidate_urls=candidate_urls,
+        source_task=source_task,
     )
     prompt_text = _append_verified_installer_hint(prompt_text, prior_verification_result)
     return prompt_text + "\n\n" + "\n\n".join(details)
@@ -903,6 +952,7 @@ def cmd_run_session(args: argparse.Namespace) -> int:
             execution_style=execution_style,
             staging_subdir=local_fallback_staging_subdir,
         )
+    _attach_source_task_prompt_key(teacher_plan.chunks, source_task=teacher_plan.source_task or args.task)
     write_teacher_bundle(
         session_root=session_root,
         teacher_prompt=teacher_prompt,
@@ -995,6 +1045,7 @@ def cmd_run_session(args: argparse.Namespace) -> int:
                 chunk,
                 execution_style=execution_style,
                 candidate_urls=initial_candidate_urls,
+                source_task=teacher_plan.source_task or args.task,
             )
             prompt_text = _append_verified_installer_hint(prompt_text, previous_chunk_verification_result)
             if attempt_index > 0 and final_verification_result is not None:
@@ -1017,6 +1068,7 @@ def cmd_run_session(args: argparse.Namespace) -> int:
                     execution_style=execution_style,
                     prior_verification_result=previous_chunk_verification_result,
                     candidate_urls=retry_candidate_urls or initial_candidate_urls,
+                    source_task=teacher_plan.source_task or args.task,
                 )
             prompt_result = run_agent_prompt(
                 agent_command=str(config["agent_command"]),

@@ -26,6 +26,7 @@ from computer_use_training_generator.teacher import (
     _target_installer_keywords,
 )
 from computer_use_training_generator.cli import (
+    _attach_source_task_prompt_key,
     _collect_retry_link_request_exclusions,
     _compose_chunk_prompt,
     _compose_retry_prompt,
@@ -109,6 +110,49 @@ def test_compose_chunk_prompt_includes_explicit_open_targets() -> None:
     assert "Explicit open-target page URLs for this chunk" in prompt
     assert "- https://mydev.kr/" in prompt
     assert "primary runtime open targets" in prompt
+
+
+def test_compose_chunk_prompt_includes_top_level_source_task() -> None:
+    chunk = TeacherTaskChunk(
+        chunk_id="chunk-001",
+        title="Download installer",
+        agent_prompt="Download the Windows installer into Downloads.",
+        success_hint="installer exists",
+        verification={"checks": [{"kind": "json_marker_valid_installer"}]},
+        max_retries=1,
+        on_fail="retry_current_chunk",
+    )
+
+    prompt = _compose_chunk_prompt(
+        chunk,
+        execution_style="gui_first",
+        source_task="filezilla 설치해줘",
+    )
+
+    assert "Top-level source task for this run: filezilla 설치해줘" in prompt
+
+
+def test_attach_source_task_prompt_key_updates_marker_checks() -> None:
+    chunk = TeacherTaskChunk(
+        chunk_id="chunk-001",
+        title="Download installer",
+        agent_prompt="Download the Windows installer into Downloads.",
+        success_hint="installer exists",
+        verification={
+            "checks": [
+                {"kind": "json_marker_valid_installer", "path": "~/Downloads/computer-use-agent-context.json"},
+                {"kind": "path_exists", "path": "~/Downloads/app.exe"},
+            ]
+        },
+        max_retries=1,
+        on_fail="retry_current_chunk",
+    )
+
+    _attach_source_task_prompt_key([chunk], source_task="filezilla 설치해줘")
+
+    checks = chunk.verification["checks"]
+    assert checks[0]["prompt_key"]
+    assert "prompt_key" not in checks[1]
 
 
 def test_teacher_link_candidate_urls_from_result_parses_normalized_response() -> None:
@@ -206,6 +250,27 @@ def test_initial_chunk_candidate_urls_merges_task_and_teacher_urls() -> None:
         "https://www.filezilla.kr/theme/filezilla/download/FileZilla_3.67.0_win64-setup.exe",
         "https://mydev.kr/",
     ]
+
+
+def test_initial_chunk_candidate_urls_strip_trailing_backtick_from_teacher_url() -> None:
+    chunk = TeacherTaskChunk(
+        chunk_id="chunk-001",
+        title="Download installer",
+        agent_prompt="Open the relevant download page and fetch the installer.",
+        success_hint="installer exists",
+        verification={"checks": [{"kind": "json_marker_valid_installer"}]},
+        max_retries=1,
+        on_fail="retry_current_chunk",
+    )
+
+    urls = _initial_chunk_candidate_urls(
+        task="메모잇 설치해줘",
+        chunk=chunk,
+        teacher_text="Use https://mydev.kr/` first.",
+        teacher_plan_source_text="",
+    )
+
+    assert urls == ["https://mydev.kr/"]
 
 
 def test_extract_verified_installer_paths_skips_keyword_mismatched_marker() -> None:
@@ -338,7 +403,8 @@ def test_build_verification_code_supports_json_marker_valid_installer() -> None:
     installer_block = code.split("def _validate_json_marker_installer", 1)[1].split("evidence = []", 1)[0]
     assert "keyword_hits = [keyword for keyword in normalized_keywords if keyword in candidate_keyword_haystack]" in installer_block
     assert "marker_keyword_hits = [keyword for keyword in normalized_keywords if keyword in marker_keyword_haystack]" in installer_block
-    assert "keyword_ok = not normalized_keywords or bool(keyword_hits)" in installer_block
+    assert "alias_keyword_hits" in installer_block
+    assert "or (bool(marker_keyword_hits) and bool(alias_keyword_hits))" in installer_block
     assert 'entry["error"] = "installer_path_keyword_mismatch"' in installer_block
     assert "normalized_allowed_suffixes" in code
 
@@ -380,9 +446,9 @@ def test_build_verification_code_does_not_accept_keyword_mismatched_fallback_ins
         }
     )
     assert code is not None
-    assert "if normalized_keywords and not keyword_hits:" in code
-    assert "keyword_ok = not normalized_keywords or bool(keyword_hits)" in code
-    assert "or bool(marker_keyword_hits)" not in code
+    assert "if normalized_keywords and not keyword_hits and not (marker_keyword_hits and alias_keyword_hits):" in code
+    assert "keyword_ok = (" in code
+    assert "or (bool(marker_keyword_hits) and bool(alias_keyword_hits))" in code
 
 
 def test_build_verification_code_rejects_marker_keyword_when_installer_path_mismatches() -> None:
@@ -402,8 +468,28 @@ def test_build_verification_code_rejects_marker_keyword_when_installer_path_mism
 
     assert code is not None
     assert "marker_keyword_hits" in code
-    assert "keyword_ok = not normalized_keywords or bool(keyword_hits)" in code
+    assert "alias_keyword_hits" in code
     assert "installer_path_keyword_mismatch" in code
+
+
+def test_build_verification_code_checks_marker_prompt_key() -> None:
+    code = build_verification_code(
+        {
+            "checks": [
+                {
+                    "kind": "json_marker_valid_installer",
+                    "path": "~/Downloads/computer-use-agent-context.json",
+                    "field": "installer_path",
+                    "keywords": ["filezilla"],
+                    "prompt_key": "task-scope-123",
+                }
+            ]
+        }
+    )
+
+    assert '"prompt_key": "task-scope-123"' in code
+    assert "missing_prompt_key" in code
+    assert "prompt_key_mismatch" in code
 
 
 def test_install_execution_chunk_does_not_match_download_stage_prompt() -> None:
@@ -1031,6 +1117,23 @@ def test_build_local_teacher_fallback_for_korean_task_uses_real_app_token() -> N
     assert "카카오톡" in marker_check["keywords"]
 
 
+def test_build_local_teacher_fallback_adds_ascii_alias_keywords_from_prompt_context() -> None:
+    _, teacher_plan = build_local_teacher_fallback(
+        task="setup_memoit193.exe를 내려받아 메모잇 프로그램을 설치해줘",
+        prompt="dummy prompt",
+        command_template="codex exec '{prompt}'",
+        cwd="..",
+        error="teacher quota exhausted",
+        execution_style="gui_first",
+    )
+    download_chunk = teacher_plan.chunks[0]
+    checks = download_chunk.verification["checks"]
+    download_marker_check = next(check for check in checks if check["kind"] == "json_marker_valid_installer")
+
+    assert "메모잇" in download_marker_check["keywords"]
+    assert any(keyword.startswith("memoit") for keyword in download_marker_check["keywords"])
+
+
 def test_task_staging_subdir_changes_with_session_salt() -> None:
     task = "카카오톡 pc버전 프로그램을 설치해줘"
     first = _task_staging_subdir(task, salt="session-a")
@@ -1359,6 +1462,22 @@ def test_normalize_windows_installer_agent_prompt_keeps_official_archive_excepti
     assert "mobaxterm.mobatek.net/download-home-edition.html" not in prompt
     assert "exact official archive" in prompt or "`.zip` 또는 `.alz`" in prompt
     assert "Do not use `.zip`, portable, or archive downloads." not in prompt
+
+
+def test_normalize_windows_installer_agent_prompt_install_chunk_always_branches_archive_suffix() -> None:
+    prompt = _normalize_windows_installer_agent_prompt(
+        source_task="mobaxterm 프로그램을 설치해줘",
+        title="Install MobaXterm",
+        agent_prompt=(
+            "Use Python to locate the downloaded MobaXterm installer in Downloads, execute it, "
+            "and drive the installer wizard to completion."
+        ),
+        source_text="Use the official download page and install with default options.",
+        execution_style="gui_first",
+    )
+
+    assert "선택한 installer artifact가 `.zip` 또는 `.alz`이면 먼저 Downloads 안에서 그 archive를 추출하고" in prompt
+    assert "추출된 폴더 안의 실제 installer `.exe` 또는 `.msi`를 다시 선택해서 그 파일을 실행하세요." in prompt
 
 
 def test_normalize_chunks_rewrites_wildcard_path_exists_download_verifier_to_glob() -> None:

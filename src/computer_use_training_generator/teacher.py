@@ -4,6 +4,7 @@ import base64
 import html
 import hashlib
 import json
+from pathlib import Path
 import re
 import urllib.parse
 import urllib.request
@@ -881,6 +882,28 @@ def _extract_urls_from_text(text: str) -> list[str]:
     return urls
 
 
+def _verification_alias_keywords(*texts: str, limit: int = 6) -> list[str]:
+    alias_seed_parts: list[str] = []
+    for text in texts:
+        raw_text = str(text or "")
+        if not raw_text:
+            continue
+        for url in _extract_urls_from_text(raw_text):
+            keyword_text = _url_keyword_text(url)
+            if keyword_text:
+                alias_seed_parts.append(keyword_text)
+        for filename in re.findall(r"[A-Za-z0-9][A-Za-z0-9._-]{2,}\.(?:exe|msi|zip|alz)", raw_text, flags=re.IGNORECASE):
+            alias_seed_parts.append(Path(filename).stem)
+    aliases: list[str] = []
+    for token in _target_installer_keywords(*alias_seed_parts, limit=max(limit * 2, 8)):
+        if re.search(r"[a-z]", token) is None or token in aliases:
+            continue
+        aliases.append(token)
+        if len(aliases) >= limit:
+            break
+    return aliases
+
+
 def _remove_non_user_urls_from_prompt(source_task: str, text: str) -> str:
     user_urls = set(_extract_urls_from_text(source_task))
     if user_urls or _task_explicitly_requests_store(source_task):
@@ -1501,16 +1524,15 @@ def _normalize_windows_installer_agent_prompt(
             "실행할 installer는 현재 작업 대상 앱과 일치하는 `.exe` 또는 `.msi`만 고르세요.\n"
             + _matching_installer_hint(source_task=source_task, title=title, agent_prompt=raw, action="실행")
         )
+        archive_execution_hint = (
+            "선택한 installer artifact가 `.zip` 또는 `.alz`이면 먼저 Downloads 안에서 그 archive를 추출하고, "
+            "추출된 폴더 안의 실제 installer `.exe` 또는 `.msi`를 다시 선택해서 그 파일을 실행하세요."
+        )
         preferred_install_hint = gui_install_hint if normalized_style == "gui_first" else install_python_hint
         if preferred_install_hint not in normalized:
             normalized = f"{preferred_install_hint}\n\n{normalized}"
-        if archive_allowed:
-            archive_install_hint = (
-                "관련 source가 설치용 `.zip` 또는 `.alz` 패키지만 제공한 경우에는 먼저 그 archive를 Downloads 안에서 추출하고, "
-                "추출된 폴더 안의 실제 installer `.exe` 또는 `.msi`를 찾아 그 설치 UI를 진행하세요."
-            )
-            if archive_install_hint not in normalized:
-                normalized = f"{archive_install_hint}\n\n{normalized}"
+        if archive_execution_hint not in normalized:
+            normalized = f"{archive_execution_hint}\n\n{normalized}"
         if install_hint not in normalized:
             normalized = f"{install_hint}\n\n{normalized}"
         if exact_page_hint and exact_page_hint not in normalized:
@@ -1605,21 +1627,6 @@ def _local_install_chunks(
             f"{discovered_lines}\n"
             "Prefer the first URL if it already looks like the primary vendor or product landing page."
         )
-    target_keywords: list[str] = []
-    task_keywords = _target_installer_keywords(task, limit=6)
-    discovered_keywords = _target_installer_keywords(*discovered_keyword_parts, limit=6)
-    for token in task_keywords:
-        if token not in target_keywords:
-            target_keywords.append(token)
-    task_has_ascii_keyword = any(re.search(r"[a-z]", token) for token in target_keywords)
-    if not task_has_ascii_keyword:
-        for token in discovered_keywords:
-            if re.search(r"[a-z]", token) is None:
-                continue
-            if token not in target_keywords:
-                target_keywords.append(token)
-            if len(target_keywords) >= 6:
-                break
     staging_subdir = str(staging_subdir or _task_staging_subdir(task)).strip()
     keyword_download_glob = _downloads_installer_glob(task, *discovered_keyword_parts)
     if keyword_download_glob:
@@ -1642,22 +1649,6 @@ def _local_install_chunks(
     download_title = f"Download {keyword} installer"
     install_title = f"Install {keyword}"
     launch_title = f"Launch {keyword}"
-    if normalized_style == "gui_first":
-        download_verification_checks = [
-            {
-                "kind": "json_marker_valid_installer",
-                "path": context_path,
-                "field": "installer_path",
-                "keywords": target_keywords,
-                "bytes": 1000000,
-                "allowed_suffixes": [".exe", ".msi", ".zip", ".alz"],
-            }
-        ]
-    else:
-        download_verification_checks = [
-            {"kind": "file_exists_glob", "pattern": downloads_glob},
-            {"kind": "file_size_gt", "pattern": downloads_glob, "bytes": 1000000},
-        ]
     if normalized_style == "gui_first":
         download_prompt = (
             f"Use executable Python on the Windows machine to obtain the Windows installer `.exe` or `.msi` for the target app from this task: {task}. "
@@ -1713,6 +1704,45 @@ def _local_install_chunks(
         f"Do not redownload or reinstall the app in this chunk. Prefer existing install paths under `%LOCALAPPDATA%`, `%ProgramFiles%`, and `%ProgramFiles(x86)%`, and if the app is already running just verify that process and focus the window. "
         f"Write `{launch_marker_path}` only after the launch succeeded, and update `{context_path}` with the launched executable path."
     )
+    target_keywords: list[str] = []
+    task_keywords = _target_installer_keywords(task, limit=6)
+    alias_keywords = _verification_alias_keywords(
+        task,
+        keyword_download_glob or "",
+        download_prompt,
+        install_prompt,
+        launch_prompt,
+        discovered_source_hint,
+        limit=6,
+    )
+    for token in task_keywords:
+        if token not in target_keywords:
+            target_keywords.append(token)
+    task_has_ascii_keyword = any(re.search(r"[a-z]", token) for token in target_keywords)
+    if not task_has_ascii_keyword:
+        for token in alias_keywords:
+            if token not in target_keywords:
+                target_keywords.append(token)
+            if len(target_keywords) >= 6:
+                break
+    if not target_keywords:
+        target_keywords = alias_keywords[:6]
+    if normalized_style == "gui_first":
+        download_verification_checks = [
+            {
+                "kind": "json_marker_valid_installer",
+                "path": context_path,
+                "field": "installer_path",
+                "keywords": target_keywords,
+                "bytes": 1000000,
+                "allowed_suffixes": [".exe", ".msi", ".zip", ".alz"],
+            }
+        ]
+    else:
+        download_verification_checks = [
+            {"kind": "file_exists_glob", "pattern": downloads_glob},
+            {"kind": "file_size_gt", "pattern": downloads_glob, "bytes": 1000000},
+        ]
     return [
         TeacherTaskChunk(
             chunk_id="chunk-001",
@@ -2058,7 +2088,15 @@ def _normalize_chunks(
             verification=verification,
         )
         target_keywords = _target_installer_keywords(source_task, title, agent_prompt, limit=6)
-        source_target_keywords = _target_installer_keywords(source_task, limit=6) or target_keywords
+        source_target_keywords = _target_installer_keywords(source_task, limit=6)
+        if not any(re.search(r"[a-z]", token) for token in source_target_keywords):
+            for token in _verification_alias_keywords(source_task, source_text, agent_prompt, limit=6):
+                if token not in source_target_keywords:
+                    source_target_keywords.append(token)
+                if len(source_target_keywords) >= 6:
+                    break
+        if not source_target_keywords:
+            source_target_keywords = target_keywords
         if _looks_like_install_task(source_task):
             is_download_stage = _looks_like_download_chunk(title, agent_prompt)
             combined_stage = f"{title}\n{agent_prompt}".lower()
