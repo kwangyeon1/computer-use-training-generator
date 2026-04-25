@@ -396,8 +396,12 @@ def test_build_verification_code_supports_json_marker_valid_installer() -> None:
     )
     assert code is not None
     assert "_validate_json_marker_installer" in code
-    assert "fallback_used" not in code
-    assert "fallback_candidates = _fallback_installer_candidates(keywords, min_bytes, allowed_suffixes)" not in code
+    assert "_write_fallback_installer_path" in code
+    assert "fallback_candidates = _fallback_installer_candidates(normalized_keywords, min_bytes, allowed_suffixes)" in code
+    assert 'entry["fallback_used"] = True' in code
+    assert 'entry["fallback_installer_rewritten"] = _write_fallback_installer_path(' in code
+    assert 'entry["error"] = "fallback_installer_writeback_failed"' in code
+    assert 'rewritten["prompt_key"]' not in code
     assert 'entry["error"] = "missing_field_value"' in code
     assert "source_url" in code
     installer_block = code.split("def _validate_json_marker_installer", 1)[1].split("evidence = []", 1)[0]
@@ -490,6 +494,7 @@ def test_build_verification_code_checks_marker_prompt_key() -> None:
     assert '"prompt_key": "task-scope-123"' in code
     assert "missing_prompt_key" in code
     assert "prompt_key_mismatch" in code
+    assert 'entry["fallback_reason"] = prompt_mismatch_reason' in code
 
 
 def test_install_execution_chunk_does_not_match_download_stage_prompt() -> None:

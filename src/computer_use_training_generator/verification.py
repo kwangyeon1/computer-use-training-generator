@@ -427,7 +427,10 @@ def _fallback_installer_candidates(keywords, min_bytes, allowed_suffixes):
         suffixes = [".exe", ".msi"]
     paths = []
     for suffix in suffixes:
-        paths.extend(downloads.glob("*" + suffix))
+        try:
+            paths.extend(downloads.rglob("*" + suffix))
+        except OSError:
+            continue
     candidates = []
     for path in paths:
         if not path.is_file():
@@ -451,6 +454,24 @@ def _fallback_installer_candidates(keywords, min_bytes, allowed_suffixes):
     return [item[3] for item in candidates]
 
 
+def _write_fallback_installer_path(marker, payload, field, candidate):
+    if marker.name.lower() != "computer-use-agent-context.json":
+        return True
+    candidate_text = str(candidate or "").strip()
+    if not candidate_text:
+        return False
+    rewritten = dict(payload or {{}})
+    # Keep verifier recovery and install-stage reuse aligned by refreshing only installer_path.
+    rewritten["installer_path"] = candidate_text
+    if field and field != "installer_path":
+        rewritten[field] = candidate_text
+    try:
+        marker.write_text(json.dumps(rewritten, ensure_ascii=False, indent=2), encoding="utf-8")
+    except Exception:
+        return False
+    return True
+
+
 def _validate_json_marker_installer(marker_path, field, keywords, min_bytes, allowed_suffixes, expected_prompt_key=None):
     expanded_marker = os.path.expanduser(str(marker_path or ""))
     marker = Path(expanded_marker)
@@ -469,22 +490,39 @@ def _validate_json_marker_installer(marker_path, field, keywords, min_bytes, all
         return False, entry
     if not isinstance(payload, dict):
         payload = {{}}
+    normalized_keywords = _normalize_keywords(keywords)
     expected_prompt_key = str(expected_prompt_key or "").strip()
     stored_prompt_key = str(payload.get("prompt_key") or "").strip()
+    prompt_mismatch_reason = ""
     if expected_prompt_key:
         entry["expected_prompt_key"] = expected_prompt_key
         entry["stored_prompt_key"] = stored_prompt_key
         strict_prompt_key = marker.name.lower() == "computer-use-agent-context.json"
         if stored_prompt_key and stored_prompt_key != expected_prompt_key:
-            entry["error"] = "prompt_key_mismatch"
-            return False, entry
+            prompt_mismatch_reason = "prompt_key_mismatch"
         if strict_prompt_key and not stored_prompt_key:
-            entry["error"] = "missing_prompt_key"
-            return False, entry
+            prompt_mismatch_reason = "missing_prompt_key"
     marker_keywords = payload.get("target_keywords") or []
     if not isinstance(marker_keywords, list):
         marker_keywords = []
     raw_candidate = str(payload.get(field) or "").strip().strip('"')
+    source_url = str(payload.get("source_url") or "")
+    if prompt_mismatch_reason:
+        if raw_candidate:
+            entry["marker_value"] = raw_candidate
+        fallback_candidates = _fallback_installer_candidates(normalized_keywords, min_bytes, allowed_suffixes)
+        if not fallback_candidates:
+            entry["error"] = prompt_mismatch_reason
+            return False, entry
+        raw_candidate = str(fallback_candidates[0])
+        entry["fallback_used"] = True
+        entry["fallback_reason"] = prompt_mismatch_reason
+        entry["fallback_installer_rewritten"] = _write_fallback_installer_path(marker, payload, field, raw_candidate)
+        if not entry["fallback_installer_rewritten"]:
+            entry["error"] = "fallback_installer_writeback_failed"
+            return False, entry
+        marker_keywords = []
+        source_url = ""
     entry["value"] = raw_candidate
     if not raw_candidate:
         entry["error"] = "missing_field_value"
@@ -499,8 +537,6 @@ def _validate_json_marker_installer(marker_path, field, keywords, min_bytes, all
             entry["bytes"] = candidate.stat().st_size
         except OSError:
             entry["bytes"] = None
-    normalized_keywords = _normalize_keywords(keywords)
-    source_url = str(payload.get("source_url") or "")
     candidate_keyword_haystack = str(candidate).lower()
     candidate_name_haystack = str(candidate.name).lower()
     context_haystack = " ".join(
