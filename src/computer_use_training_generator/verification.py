@@ -472,6 +472,24 @@ def _write_fallback_installer_path(marker, payload, field, candidate):
     return True
 
 
+def _reset_context_marker_for_prompt(marker, payload, field, expected_prompt_key):
+    if marker.name.lower() != "computer-use-agent-context.json":
+        return dict(payload or {{}})
+    rewritten = dict(payload or {{}})
+    for key in ("installer_path", "source_url", "target_keywords"):
+        rewritten.pop(key, None)
+    field_name = str(field or "").strip()
+    if field_name:
+        rewritten.pop(field_name, None)
+    if expected_prompt_key:
+        rewritten["prompt_key"] = expected_prompt_key
+    try:
+        marker.write_text(json.dumps(rewritten, ensure_ascii=False, indent=2), encoding="utf-8")
+    except Exception:
+        return None
+    return rewritten
+
+
 def _validate_json_marker_installer(marker_path, field, keywords, min_bytes, allowed_suffixes, expected_prompt_key=None):
     expanded_marker = os.path.expanduser(str(marker_path or ""))
     marker = Path(expanded_marker)
@@ -510,19 +528,27 @@ def _validate_json_marker_installer(marker_path, field, keywords, min_bytes, all
     if prompt_mismatch_reason:
         if raw_candidate:
             entry["marker_value"] = raw_candidate
+        reset_payload = _reset_context_marker_for_prompt(marker, payload, field, expected_prompt_key)
+        entry["context_reinitialized"] = reset_payload is not None
+        if reset_payload is None:
+            entry["error"] = "context_reinitialization_failed"
+            return False, entry
+        payload = reset_payload
         fallback_candidates = _fallback_installer_candidates(normalized_keywords, min_bytes, allowed_suffixes)
         if not fallback_candidates:
-            entry["error"] = prompt_mismatch_reason
-            return False, entry
-        raw_candidate = str(fallback_candidates[0])
-        entry["fallback_used"] = True
-        entry["fallback_reason"] = prompt_mismatch_reason
-        entry["fallback_installer_rewritten"] = _write_fallback_installer_path(marker, payload, field, raw_candidate)
-        if not entry["fallback_installer_rewritten"]:
-            entry["error"] = "fallback_installer_writeback_failed"
-            return False, entry
-        marker_keywords = []
-        source_url = ""
+            raw_candidate = ""
+            marker_keywords = []
+            source_url = ""
+        else:
+            raw_candidate = str(fallback_candidates[0])
+            entry["fallback_used"] = True
+            entry["fallback_reason"] = prompt_mismatch_reason
+            entry["fallback_installer_rewritten"] = _write_fallback_installer_path(marker, payload, field, raw_candidate)
+            if not entry["fallback_installer_rewritten"]:
+                entry["error"] = "fallback_installer_writeback_failed"
+                return False, entry
+            marker_keywords = []
+            source_url = ""
     entry["value"] = raw_candidate
     if not raw_candidate:
         entry["error"] = "missing_field_value"
