@@ -218,6 +218,7 @@ import os
 from pathlib import Path
 import re
 import subprocess
+import time
 
 CHECKS = json.loads({checks_json!r})
 SYSTEM_APP_NAMES = {{
@@ -414,6 +415,9 @@ def _fallback_installer_candidates(keywords, min_bytes, allowed_suffixes):
     if not downloads.exists():
         return []
     normalized_keywords = _normalize_keywords(keywords)
+    allow_relaxed_keyword_match = bool(normalized_keywords) and not any(
+        re.search(r"[a-z0-9]", keyword) for keyword in normalized_keywords
+    )
     suffixes = []
     for suffix in allowed_suffixes or (".exe", ".msi"):
         lowered = str(suffix or "").strip().lower()
@@ -446,12 +450,15 @@ def _fallback_installer_candidates(keywords, min_bytes, allowed_suffixes):
         if "portable" in lowered and not any("portable" in keyword for keyword in normalized_keywords):
             continue
         keyword_hits = [keyword for keyword in normalized_keywords if keyword in lowered]
-        if normalized_keywords and not keyword_hits:
-            continue
         installer_name_bonus = 1 if any(token in path.name.lower() for token in ("setup", "installer", "install", "package", "archive")) else 0
-        candidates.append((len(keyword_hits), installer_name_bonus, mtime, path))
-    candidates.sort(reverse=True, key=lambda item: item[:3])
-    return [item[3] for item in candidates]
+        relaxed_keyword_bonus = 0
+        if normalized_keywords and not keyword_hits:
+            if not allow_relaxed_keyword_match or installer_name_bonus <= 0 or (time.time() - float(mtime)) > 172800:
+                continue
+            relaxed_keyword_bonus = 1
+        candidates.append((len(keyword_hits), relaxed_keyword_bonus, installer_name_bonus, mtime, path))
+    candidates.sort(reverse=True, key=lambda item: item[:4])
+    return [item[4] for item in candidates]
 
 
 def _write_fallback_installer_path(marker, payload, field, candidate):
@@ -549,6 +556,16 @@ def _validate_json_marker_installer(marker_path, field, keywords, min_bytes, all
                 return False, entry
             marker_keywords = []
             source_url = ""
+    if not raw_candidate:
+        fallback_candidates = _fallback_installer_candidates(normalized_keywords, min_bytes, allowed_suffixes)
+        if fallback_candidates:
+            raw_candidate = str(fallback_candidates[0])
+            entry["fallback_used"] = True
+            entry["fallback_reason"] = "missing_field_value"
+            entry["fallback_installer_rewritten"] = _write_fallback_installer_path(marker, payload, field, raw_candidate)
+            if not entry["fallback_installer_rewritten"]:
+                entry["error"] = "fallback_installer_writeback_failed"
+                return False, entry
     entry["value"] = raw_candidate
     if not raw_candidate:
         entry["error"] = "missing_field_value"
@@ -643,6 +660,12 @@ def _validate_json_marker_installer(marker_path, field, keywords, min_bytes, all
     if not normalized_allowed_suffixes:
         normalized_allowed_suffixes = [".exe", ".msi"]
     entry["allowed_suffixes"] = normalized_allowed_suffixes
+    relaxed_keyword_ok = (
+        bool(entry.get("fallback_used"))
+        and str(entry.get("fallback_reason") or "") == "missing_field_value"
+        and bool(normalized_keywords)
+        and not any(re.search(r"[a-z0-9]", keyword) for keyword in normalized_keywords)
+    )
     # The marker can be stale or polluted, so path keyword matches stay primary.
     # As a narrow bridge for vendor-specific filenames, allow marker/source alias
     # keywords only when the original verifier keyword matched marker metadata and
@@ -651,8 +674,9 @@ def _validate_json_marker_installer(marker_path, field, keywords, min_bytes, all
         not normalized_keywords
         or bool(keyword_hits)
         or (bool(marker_keyword_hits) and bool(alias_keyword_hits))
+        or relaxed_keyword_ok
     )
-    if normalized_keywords and not keyword_hits and not (marker_keyword_hits and alias_keyword_hits):
+    if normalized_keywords and not keyword_hits and not (marker_keyword_hits and alias_keyword_hits) and not relaxed_keyword_ok:
         entry["error"] = "installer_path_keyword_mismatch"
     portable_ok = "portable" not in context_haystack or any("portable" in keyword for keyword in normalized_keywords)
     ok = (
