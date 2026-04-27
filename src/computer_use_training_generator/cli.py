@@ -201,7 +201,7 @@ def _strip_trailing_korean_particle_from_url_candidate(candidate: str) -> str:
 
 def _extract_http_urls(text: str, *, limit: int = 5) -> list[str]:
     return _normalize_http_candidate_urls(
-        re.findall(r"https?://[^\s\"'<>]+", str(text or "")),
+        re.findall(r"https?://[^\s<>()\[\]{}\"'`]+", str(text or "")),
         limit=limit,
     )
 

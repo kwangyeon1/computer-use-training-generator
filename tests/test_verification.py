@@ -1,3 +1,5 @@
+import contextlib
+import io
 import json
 from unittest.mock import patch
 
@@ -30,6 +32,7 @@ from computer_use_training_generator.cli import (
     _collect_retry_link_request_exclusions,
     _compose_chunk_prompt,
     _compose_retry_prompt,
+    _extract_http_urls,
     _extract_verified_installer_paths,
     _extract_retry_exclusion_urls_and_queries,
     _initial_chunk_candidate_urls,
@@ -273,6 +276,12 @@ def test_initial_chunk_candidate_urls_strip_trailing_backtick_from_teacher_url()
     assert urls == ["https://mydev.kr/"]
 
 
+def test_extract_http_urls_handles_markdown_inline_link_without_merging_urls() -> None:
+    urls = _extract_http_urls("브라우저로 [`https://mydev.kr/`](https://mydev.kr/) 접속", limit=10)
+
+    assert urls == ["https://mydev.kr/"]
+
+
 def test_extract_verified_installer_paths_skips_keyword_mismatched_marker() -> None:
     result = {
         "passed": True,
@@ -401,7 +410,9 @@ def test_build_verification_code_supports_json_marker_valid_installer() -> None:
     assert 'entry["fallback_used"] = True' in code
     assert 'entry["fallback_installer_rewritten"] = _write_fallback_installer_path(' in code
     assert 'entry["error"] = "fallback_installer_writeback_failed"' in code
-    assert 'rewritten["prompt_key"]' not in code
+    assert "_reset_context_marker_for_prompt" in code
+    assert 'rewritten["prompt_key"] = expected_prompt_key' in code
+    assert 'entry["fallback_reason"] = "missing_field_value"' in code
     assert 'entry["error"] = "missing_field_value"' in code
     assert "source_url" in code
     installer_block = code.split("def _validate_json_marker_installer", 1)[1].split("evidence = []", 1)[0]
@@ -409,6 +420,7 @@ def test_build_verification_code_supports_json_marker_valid_installer() -> None:
     assert "marker_keyword_hits = [keyword for keyword in normalized_keywords if keyword in marker_keyword_haystack]" in installer_block
     assert "alias_keyword_hits" in installer_block
     assert "or (bool(marker_keyword_hits) and bool(alias_keyword_hits))" in installer_block
+    assert "or relaxed_keyword_ok" in installer_block
     assert 'entry["error"] = "installer_path_keyword_mismatch"' in installer_block
     assert "normalized_allowed_suffixes" in code
 
@@ -450,7 +462,7 @@ def test_build_verification_code_does_not_accept_keyword_mismatched_fallback_ins
         }
     )
     assert code is not None
-    assert "if normalized_keywords and not keyword_hits and not (marker_keyword_hits and alias_keyword_hits):" in code
+    assert "if normalized_keywords and not keyword_hits and not (marker_keyword_hits and alias_keyword_hits) and not relaxed_keyword_ok:" in code
     assert "keyword_ok = (" in code
     assert "or (bool(marker_keyword_hits) and bool(alias_keyword_hits))" in code
 
@@ -495,6 +507,152 @@ def test_build_verification_code_checks_marker_prompt_key() -> None:
     assert "missing_prompt_key" in code
     assert "prompt_key_mismatch" in code
     assert 'entry["fallback_reason"] = prompt_mismatch_reason' in code
+
+
+def test_generated_verification_reinitializes_stale_context_before_fallback(tmp_path, monkeypatch) -> None:
+    downloads = tmp_path / "Downloads"
+    downloads.mkdir(parents=True)
+    installer = downloads / "KakaoTalk_Setup.exe"
+    installer.write_bytes(b"x" * 1_100_000)
+    marker = downloads / "computer-use-agent-context.json"
+    marker.write_text(
+        json.dumps(
+            {
+                "prompt_key": "old-task-key",
+                "installer_path": r"C:\Users\qkqxl\Downloads\MobaXterm_Installer_v26.3.zip",
+                "source_url": "https://mobaxterm.mobatek.net/",
+                "target_keywords": ["mobaxterm"],
+            },
+            ensure_ascii=False,
+            indent=2,
+        ),
+        encoding="utf-8",
+    )
+    monkeypatch.setenv("HOME", str(tmp_path))
+    code = build_verification_code(
+        {
+            "checks": [
+                {
+                    "kind": "json_marker_valid_installer",
+                    "path": "~/Downloads/computer-use-agent-context.json",
+                    "field": "installer_path",
+                    "keywords": ["kakaotalk"],
+                    "bytes": 1000000,
+                    "prompt_key": "new-task-key",
+                }
+            ]
+        }
+    )
+
+    stdout = io.StringIO()
+    with contextlib.redirect_stdout(stdout):
+        exec(code, {"__builtins__": __builtins__, "__name__": "__main__"})
+    payload = json.loads(stdout.getvalue().strip().splitlines()[-1])
+    evidence = payload["evidence"][0]
+    updated_marker = json.loads(marker.read_text(encoding="utf-8"))
+
+    assert payload["passed"] is True
+    assert evidence["context_reinitialized"] is True
+    assert evidence["fallback_used"] is True
+    assert updated_marker["prompt_key"] == "new-task-key"
+    assert updated_marker["installer_path"].endswith("KakaoTalk_Setup.exe")
+
+
+def test_generated_verification_reinitializes_stale_context_without_carrying_old_installer(tmp_path, monkeypatch) -> None:
+    downloads = tmp_path / "Downloads"
+    downloads.mkdir(parents=True)
+    marker = downloads / "computer-use-agent-context.json"
+    marker.write_text(
+        json.dumps(
+            {
+                "prompt_key": "old-task-key",
+                "installer_path": r"C:\Users\qkqxl\Downloads\MobaXterm_Installer_v26.3.zip",
+                "source_url": "https://mobaxterm.mobatek.net/",
+                "target_keywords": ["mobaxterm"],
+            },
+            ensure_ascii=False,
+            indent=2,
+        ),
+        encoding="utf-8",
+    )
+    monkeypatch.setenv("HOME", str(tmp_path))
+    code = build_verification_code(
+        {
+            "checks": [
+                {
+                    "kind": "json_marker_valid_installer",
+                    "path": "~/Downloads/computer-use-agent-context.json",
+                    "field": "installer_path",
+                    "keywords": ["kakaotalk"],
+                    "bytes": 1000000,
+                    "prompt_key": "new-task-key",
+                }
+            ]
+        }
+    )
+
+    stdout = io.StringIO()
+    with contextlib.redirect_stdout(stdout):
+        exec(code, {"__builtins__": __builtins__, "__name__": "__main__"})
+    payload = json.loads(stdout.getvalue().strip().splitlines()[-1])
+    evidence = payload["evidence"][0]
+    updated_marker = json.loads(marker.read_text(encoding="utf-8"))
+
+    assert payload["passed"] is False
+    assert evidence["context_reinitialized"] is True
+    assert evidence["error"] == "missing_field_value"
+    assert updated_marker["prompt_key"] == "new-task-key"
+    assert "installer_path" not in updated_marker
+    assert "source_url" not in updated_marker
+    assert "target_keywords" not in updated_marker
+
+
+def test_generated_verification_backfills_missing_installer_path_from_recent_hangul_task_download(tmp_path, monkeypatch) -> None:
+    downloads = tmp_path / "Downloads"
+    downloads.mkdir(parents=True)
+    installer = downloads / "setup_memoit193.exe"
+    installer.write_bytes(b"x" * 1_200_000)
+    marker = downloads / "computer-use-agent-context.json"
+    marker.write_text(
+        json.dumps(
+            {
+                "prompt_key": "memoit-task-key",
+                "installer_path": "",
+                "target_keywords": ["메모잇"],
+                "phase": "download_click_attempted",
+            },
+            ensure_ascii=False,
+            indent=2,
+        ),
+        encoding="utf-8",
+    )
+    monkeypatch.setenv("HOME", str(tmp_path))
+    code = build_verification_code(
+        {
+            "checks": [
+                {
+                    "kind": "json_marker_valid_installer",
+                    "path": "~/Downloads/computer-use-agent-context.json",
+                    "field": "installer_path",
+                    "keywords": ["메모잇"],
+                    "bytes": 1000000,
+                    "prompt_key": "memoit-task-key",
+                }
+            ]
+        }
+    )
+
+    stdout = io.StringIO()
+    with contextlib.redirect_stdout(stdout):
+        exec(code, {"__builtins__": __builtins__, "__name__": "__main__"})
+    payload = json.loads(stdout.getvalue().strip().splitlines()[-1])
+    evidence = payload["evidence"][0]
+    updated_marker = json.loads(marker.read_text(encoding="utf-8"))
+
+    assert payload["passed"] is True
+    assert evidence["fallback_used"] is True
+    assert evidence["fallback_reason"] == "missing_field_value"
+    assert updated_marker["installer_path"].endswith("setup_memoit193.exe")
 
 
 def test_install_execution_chunk_does_not_match_download_stage_prompt() -> None:
