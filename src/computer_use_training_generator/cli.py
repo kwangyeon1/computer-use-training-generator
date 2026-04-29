@@ -26,10 +26,12 @@ from .config_utils import load_generator_config
 from .models import TeacherChunkPlanResult, TeacherTaskChunk
 from .teacher import (
     _extract_link_candidate_urls,
+    _looks_like_install_execution_chunk,
     _target_installer_keywords,
     _task_staging_subdir,
     build_local_teacher_fallback,
     run_teacher_link_candidates,
+    run_teacher_visible_click_candidate,
     run_teacher,
     split_teacher_response,
 )
@@ -289,76 +291,14 @@ def _compose_chunk_prompt(
     return "\n\n".join(part for part in parts if part)
 
 
-def _extract_verified_installer_paths(verification_result: dict | None) -> list[str]:
-    if not verification_result:
-        return []
-    evidence = verification_result.get("evidence") or []
-    results: list[str] = []
-    seen: set[str] = set()
-    for entry in evidence:
-        if not isinstance(entry, dict):
-            continue
-        if entry.get("passed") is False:
-            continue
-        keywords = [str(item).strip().lower() for item in (entry.get("keywords") or []) if str(item).strip()]
-        keyword_hits = [str(item).strip().lower() for item in (entry.get("keyword_hits") or []) if str(item).strip()]
-        if keywords and not keyword_hits:
-            continue
-        kind = str(entry.get("kind") or "")
-        if kind not in {"path_exists", "file_exists_glob", "file_size_gt", "json_marker_valid_installer"}:
-            continue
-        candidates: list[str] = []
-        path_value = str(entry.get("path") or "").strip()
-        pattern_value = str(entry.get("pattern") or "").strip()
-        resolved_path_value = str(entry.get("resolved_path") or "").strip()
-        if path_value:
-            candidates.append(path_value)
-        if resolved_path_value:
-            candidates.append(resolved_path_value)
-        if pattern_value.lower().endswith((".exe", ".msi")) and "*" not in pattern_value:
-            candidates.append(pattern_value)
-        matches = entry.get("matches") or []
-        if isinstance(matches, list):
-            for match in matches:
-                if isinstance(match, dict):
-                    candidate = str(match.get("path") or "").strip()
-                else:
-                    candidate = str(match or "").strip()
-                if candidate:
-                    candidates.append(candidate)
-        for candidate in candidates:
-            normalized = candidate.replace("\\", "/").rstrip()
-            if not normalized.lower().endswith((".exe", ".msi")):
-                continue
-            lowered = normalized.lower()
-            if lowered in seen:
-                continue
-            seen.add(lowered)
-            results.append(candidate)
-    return results
-
-
-def _append_verified_installer_hint(prompt_text: str, verification_result: dict | None) -> str:
-    installer_paths = _extract_verified_installer_paths(verification_result)
-    if not installer_paths:
-        return prompt_text
-    details = "\n".join(f"- `{path}`" for path in installer_paths[:3])
-    hint = (
-        "Previously verified installer artifacts on the target machine. Prefer these exact installer paths before "
-        "searching Downloads broadly again:\n"
-        f"{details}"
-    )
-    return prompt_text + "\n\n" + hint
-
-
 def _compose_retry_prompt(
     *,
     chunk: TeacherTaskChunk,
     verification_result: dict,
     attempt_index: int,
     execution_style: str = "python_first",
-    prior_verification_result: dict | None = None,
     candidate_urls: list[str] | None = None,
+    visible_click_candidate: dict | None = None,
     source_task: str | None = None,
 ) -> str:
     evidence = verification_result.get("evidence")
@@ -404,13 +344,21 @@ def _compose_retry_prompt(
             "Use the explicit open-target URLs listed above before generic search, but still verify that the visible "
             "page and download result match this chunk target."
         )
+    if visible_click_candidate:
+        details.append(
+            "Teacher-selected visible installer action queue:\n"
+            "TEACHER_VISIBLE_INSTALLER_ACTIONS: "
+            + json.dumps({"actions": [visible_click_candidate]}, ensure_ascii=False, separators=(",", ":"))
+        )
+        details.append(
+            "If the current screenshot still shows this installer control, click that exact coordinate before pressing Enter or relaunching the installer."
+        )
     prompt_text = _compose_chunk_prompt(
         chunk,
         execution_style=execution_style,
         candidate_urls=candidate_urls,
         source_task=source_task,
     )
-    prompt_text = _append_verified_installer_hint(prompt_text, prior_verification_result)
     return prompt_text + "\n\n" + "\n\n".join(details)
 
 
@@ -687,6 +635,147 @@ def _request_teacher_retry_link_candidates(
     path.parent.mkdir(parents=True, exist_ok=True)
     path.write_text(json.dumps(payload, ensure_ascii=False, indent=2), encoding="utf-8")
     return candidate_urls
+
+
+def _latest_model_ui_candidates_from_agent_run(run_dir: str | None, *, limit: int = 12) -> list[dict]:
+    if not run_dir:
+        return []
+    responses_dir = Path(str(run_dir)) / "responses"
+    if not responses_dir.exists():
+        return []
+    candidates: list[dict] = []
+    candidate_files = [
+        *sorted(responses_dir.glob("step-*.installer-ui-candidates.json"), reverse=True),
+        *sorted(responses_dir.glob("step-*.model-ui-candidates.json"), reverse=True),
+    ]
+    for path in candidate_files:
+        try:
+            payload = json.loads(path.read_text(encoding="utf-8"))
+        except Exception:
+            continue
+        raw_candidates = payload.get("candidates")
+        if not isinstance(raw_candidates, list):
+            continue
+        for item in raw_candidates:
+            if not isinstance(item, dict):
+                continue
+            point = item.get("click_point") or item.get("point")
+            if not isinstance(point, list) or len(point) < 2:
+                continue
+            try:
+                click_point = [int(point[0]), int(point[1])]
+            except (TypeError, ValueError):
+                continue
+            candidate = {
+                "candidate_id": str(item.get("candidate_id") or f"candidate-{len(candidates):02d}"),
+                "text": str(item.get("text") or "")[:160],
+                "click_point": click_point,
+                "bbox": item.get("bbox") if isinstance(item.get("bbox"), list) else None,
+                "reason_tags": [str(tag) for tag in item.get("reason_tags") or item.get("tags") or []],
+                "score": int(item.get("score") or 0),
+            }
+            candidates.append(candidate)
+            if len(candidates) >= limit:
+                return candidates
+        if candidates:
+            return candidates[:limit]
+    return candidates[:limit]
+
+
+def _teacher_visible_click_from_result(result_text: str) -> dict | None:
+    try:
+        payload = json.loads(result_text)
+    except json.JSONDecodeError:
+        return None
+    selected: dict | None = None
+    raw_actions = payload.get("actions")
+    if isinstance(raw_actions, list):
+        for item in raw_actions:
+            if not isinstance(item, dict):
+                continue
+            if str(item.get("action") or "click").strip().lower() != "click":
+                continue
+            selected = item
+            break
+    elif isinstance(payload.get("selected_click"), dict):
+        selected = payload.get("selected_click")
+    if not isinstance(selected, dict):
+        return None
+    point = selected.get("point") or selected.get("click_point")
+    if not isinstance(point, list) or len(point) < 2:
+        return None
+    try:
+        normalized_point = [int(point[0]), int(point[1])]
+    except (TypeError, ValueError):
+        return None
+    if not selected.get("text") and not selected.get("candidate_id"):
+        return None
+    return {
+        "action": "click",
+        "candidate_id": str(selected.get("candidate_id") or "").strip(),
+        "text": str(selected.get("text") or "").strip(),
+        "point": normalized_point,
+        "reason": str(selected.get("reason") or "").strip(),
+    }
+
+
+def _request_teacher_visible_click_candidate(
+    *,
+    task: str,
+    chunk: TeacherTaskChunk,
+    verification_result: dict | None,
+    teacher_command_template: str,
+    teacher_workdir: str | None,
+    teacher_timeout_s: float,
+    session_root: Path,
+    agent_run_label: str,
+    execution_style: str,
+    prior_agent_run_dir: str | None,
+) -> dict | None:
+    if _normalize_execution_style(execution_style) != "gui_first":
+        return None
+    if not _looks_like_install_execution_chunk(chunk.title, chunk.agent_prompt):
+        return None
+    if not str(teacher_command_template or "").strip():
+        return None
+    candidates = _latest_model_ui_candidates_from_agent_run(prior_agent_run_dir)
+    if not candidates:
+        return None
+    failure_context = json.dumps(verification_result or {}, ensure_ascii=False, indent=2)
+    try:
+        result = run_teacher_visible_click_candidate(
+            task=task,
+            chunk_title=chunk.title,
+            chunk_prompt=chunk.agent_prompt,
+            failure_context=failure_context,
+            candidates=candidates,
+            command_template=teacher_command_template,
+            cwd=teacher_workdir,
+            timeout_s=min(max(float(teacher_timeout_s), 30.0), 180.0),
+        )
+    except Exception as exc:
+        payload = {
+            "ok": False,
+            "error": str(exc),
+            "candidates": candidates,
+        }
+        path = session_root / "agent_runs" / f"{agent_run_label}.teacher_visible_click.json"
+        path.parent.mkdir(parents=True, exist_ok=True)
+        path.write_text(json.dumps(payload, ensure_ascii=False, indent=2), encoding="utf-8")
+        return None
+    selected_click = _teacher_visible_click_from_result(result.response_text)
+    payload = {
+        "ok": True,
+        "teacher_prompt": result.prompt,
+        "teacher_response": result.response_text,
+        "selected_click": selected_click,
+        "candidates": candidates,
+        "command_result": asdict(result.command_result),
+    }
+    path = session_root / "agent_runs" / f"{agent_run_label}.teacher_visible_click.json"
+    path.parent.mkdir(parents=True, exist_ok=True)
+    path.write_text(json.dumps(payload, ensure_ascii=False, indent=2), encoding="utf-8")
+    return selected_click
 
 
 def _teacher_execution_style_context(execution_style: str) -> str:
@@ -1047,7 +1136,6 @@ def cmd_run_session(args: argparse.Namespace) -> int:
                 candidate_urls=initial_candidate_urls,
                 source_task=teacher_plan.source_task or args.task,
             )
-            prompt_text = _append_verified_installer_hint(prompt_text, previous_chunk_verification_result)
             if attempt_index > 0 and final_verification_result is not None:
                 retry_agent_run_label = f"chunk-{chunk_index:03d}.attempt-{attempt_index + 1:02d}"
                 retry_candidate_urls = _request_teacher_retry_link_candidates(
@@ -1061,13 +1149,25 @@ def cmd_run_session(args: argparse.Namespace) -> int:
                     agent_run_label=retry_agent_run_label,
                     execution_style=execution_style,
                 )
+                retry_visible_click = _request_teacher_visible_click_candidate(
+                    task=args.task,
+                    chunk=chunk,
+                    verification_result=final_verification_result,
+                    teacher_command_template=teacher_command_template,
+                    teacher_workdir=teacher_workdir,
+                    teacher_timeout_s=float(config.get("teacher_split_timeout_s", teacher_timeout_s)),
+                    session_root=session_root,
+                    agent_run_label=retry_agent_run_label,
+                    execution_style=execution_style,
+                    prior_agent_run_dir=final_run_dir,
+                )
                 prompt_text = _compose_retry_prompt(
                     chunk=chunk,
                     verification_result=final_verification_result,
                     attempt_index=attempt_index,
                     execution_style=execution_style,
-                    prior_verification_result=previous_chunk_verification_result,
                     candidate_urls=retry_candidate_urls or initial_candidate_urls,
+                    visible_click_candidate=retry_visible_click,
                     source_task=teacher_plan.source_task or args.task,
                 )
             prompt_result = run_agent_prompt(

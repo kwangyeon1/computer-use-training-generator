@@ -114,6 +114,37 @@ Requirements:
 - If no relevant page URL is known, return {{"candidate_urls":[],"notes":"no relevant URL found"}}.
 """
 
+_VISIBLE_INSTALLER_CLICK_PROMPT_TEMPLATE = """Return strict JSON only.
+
+The computer-use agent is on a Windows installer GUI step. The visible installer did not advance, likely because the next/install button is disabled until another visible control such as agree/accept/confirm is selected.
+
+Task:
+{task}
+
+Chunk title:
+{chunk_title}
+
+Chunk prompt:
+{chunk_prompt}
+
+Failure/verifier context:
+{failure_context}
+
+Installer-visible OCR candidates from the latest cropped installer/dialog screenshot:
+{candidates_json}
+
+Requirements:
+- Choose exactly one candidate to click next.
+- The candidates are already limited to the installer/dialog UI region. Do not infer browser/download-page actions here.
+- Prefer controls that enable progress, such as agree, accept, confirm, ok, yes, 동의, 확인, 예, 약관 동의.
+- If Next/다음/Install/설치 appears disabled or likely blocked, choose the required agreement/confirm control instead.
+- Do not choose cancel, close, back, decline, no, 취소, 닫기, 뒤로, 거부, 아니오.
+- Output exactly one JSON object with this shape: {{"actions":[{{"action":"click","point":[x,y],"text":"candidate text"}}]}}
+- Use only a point that appears in the input candidates.
+- Return exactly one action when a useful visible control exists.
+- If no useful candidate exists, return {{"actions":[]}}.
+"""
+
 _GENERIC_INSTALLER_TOKENS = {
     "downloads",
     "download",
@@ -2038,6 +2069,133 @@ def run_teacher_link_candidates(
     normalized_response = json.dumps(
         {
             "candidate_urls": urls,
+            "raw_response": response_text,
+        },
+        ensure_ascii=False,
+        indent=2,
+    )
+    return TeacherResult(prompt=prompt, response_text=normalized_response, command_result=result)
+
+
+def _teacher_visible_click_candidate_from_result(
+    text: str,
+    *,
+    candidates: list[dict],
+) -> dict | None:
+    try:
+        payload = _extract_json_object(text)
+    except Exception:
+        return None
+
+    action_payload: dict | None = None
+    if isinstance(payload, dict):
+        raw_actions = payload.get("actions")
+        if isinstance(raw_actions, list):
+            for item in raw_actions:
+                if not isinstance(item, dict):
+                    continue
+                if str(item.get("action") or "click").strip().lower() != "click":
+                    continue
+                action_payload = item
+                break
+        elif isinstance(payload.get("selected_click"), dict):
+            action_payload = payload.get("selected_click")
+        else:
+            action_payload = payload
+    if not isinstance(action_payload, dict):
+        return None
+
+    raw_point = action_payload.get("point") or action_payload.get("click_point")
+    if not isinstance(raw_point, list) or len(raw_point) < 2:
+        return None
+    try:
+        point = [int(raw_point[0]), int(raw_point[1])]
+    except (TypeError, ValueError):
+        return None
+
+    candidate_id = str(action_payload.get("candidate_id") or payload.get("candidate_id") or "").strip()
+    reason = str(action_payload.get("reason") or payload.get("reason") or "").strip()
+    text_value = str(action_payload.get("text") or payload.get("text") or "").strip()
+
+    def _candidate_result(item: dict, matched_point: list[int]) -> dict:
+        return {
+            "action": "click",
+            "point": matched_point,
+            "text": str(item.get("text") or text_value or "").strip(),
+            "candidate_id": str(item.get("candidate_id") or candidate_id).strip(),
+            "reason": reason,
+        }
+
+    by_id = {
+        str(item.get("candidate_id") or "").strip(): item
+        for item in candidates
+        if str(item.get("candidate_id") or "").strip()
+    }
+    if candidate_id and candidate_id in by_id:
+        item = by_id[candidate_id]
+        original_point = item.get("click_point") or item.get("point")
+        if isinstance(original_point, list) and len(original_point) >= 2:
+            try:
+                point = [int(original_point[0]), int(original_point[1])]
+            except (TypeError, ValueError):
+                pass
+        return _candidate_result(item, point)
+    for item in candidates:
+        original_point = item.get("click_point") or item.get("point")
+        if not isinstance(original_point, list) or len(original_point) < 2:
+            continue
+        try:
+            original = [int(original_point[0]), int(original_point[1])]
+        except (TypeError, ValueError):
+            continue
+        if original == point:
+            return _candidate_result(item, original)
+    nearest: tuple[int, dict, list[int]] | None = None
+    for item in candidates:
+        original_point = item.get("click_point") or item.get("point")
+        if not isinstance(original_point, list) or len(original_point) < 2:
+            continue
+        try:
+            original = [int(original_point[0]), int(original_point[1])]
+        except (TypeError, ValueError):
+            continue
+        distance_sq = (original[0] - point[0]) ** 2 + (original[1] - point[1]) ** 2
+        if nearest is None or distance_sq < nearest[0]:
+            nearest = (distance_sq, item, original)
+    if nearest is not None and nearest[0] <= 48 * 48:
+        return _candidate_result(nearest[1], nearest[2])
+    return None
+
+
+def run_teacher_visible_click_candidate(
+    *,
+    task: str,
+    chunk_title: str,
+    chunk_prompt: str,
+    failure_context: str,
+    candidates: list[dict],
+    command_template: str,
+    cwd: str | None,
+    timeout_s: float,
+) -> TeacherResult:
+    candidates_json = json.dumps(candidates[:12], ensure_ascii=False, indent=2)
+    prompt = _VISIBLE_INSTALLER_CLICK_PROMPT_TEMPLATE.format(
+        task=task.strip(),
+        chunk_title=chunk_title.strip(),
+        chunk_prompt=chunk_prompt.strip(),
+        failure_context=failure_context.strip(),
+        candidates_json=candidates_json,
+    )
+    result, response_text = _run_teacher_command(
+        prompt=prompt,
+        command_template=command_template,
+        cwd=cwd,
+        timeout_s=timeout_s,
+    )
+    selected = _teacher_visible_click_candidate_from_result(response_text, candidates=candidates)
+    normalized_response = json.dumps(
+        {
+            "actions": [selected] if selected else [],
             "raw_response": response_text,
         },
         ensure_ascii=False,

@@ -18,6 +18,7 @@ from computer_use_training_generator.teacher import (
     _looks_like_store_detour_prompt,
     _merge_gui_first_navigation_chunks,
     _normalize_chunks,
+    _teacher_visible_click_candidate_from_result,
     build_local_teacher_fallback,
     _normalize_general_gui_agent_prompt,
     _normalize_windows_installer_agent_prompt,
@@ -33,10 +34,11 @@ from computer_use_training_generator.cli import (
     _compose_chunk_prompt,
     _compose_retry_prompt,
     _extract_http_urls,
-    _extract_verified_installer_paths,
     _extract_retry_exclusion_urls_and_queries,
     _initial_chunk_candidate_urls,
+    _latest_model_ui_candidates_from_agent_run,
     _teacher_link_candidate_urls_from_result,
+    _teacher_visible_click_from_result,
     _should_stop_after_install_completion,
     _teacher_execution_style_context,
 )
@@ -91,6 +93,98 @@ def test_compose_retry_prompt_includes_teacher_candidate_urls() -> None:
     assert "Explicit open-target page URLs for this chunk" in prompt
     assert "- https://example.com/download" in prompt
     assert "Use the explicit open-target URLs listed above before generic search" in prompt
+
+
+def test_compose_retry_prompt_includes_teacher_visible_installer_click() -> None:
+    chunk = TeacherTaskChunk(
+        chunk_id="chunk-002",
+        title="Run installer",
+        agent_prompt="Run the downloaded Windows installer and complete setup.",
+        success_hint="app installed",
+        verification={"checks": [{"kind": "json_marker_valid_exe"}]},
+        max_retries=1,
+        on_fail="retry_current_chunk",
+    )
+    prompt = _compose_retry_prompt(
+        chunk=chunk,
+        verification_result={"passed": False, "evidence": []},
+        attempt_index=1,
+        execution_style="gui_first",
+        visible_click_candidate={
+            "action": "click",
+            "candidate_id": "model-ui-02",
+            "text": "동의",
+            "point": [860, 640],
+            "reason": "agreement control enables Next",
+        },
+    )
+
+    assert "TEACHER_VISIBLE_INSTALLER_ACTIONS:" in prompt
+    assert '"actions":[{"action":"click"' in prompt
+    assert '"point":[860,640]' in prompt
+    assert "click that exact coordinate before pressing Enter" in prompt
+
+
+def test_latest_model_ui_candidates_from_agent_run_reads_latest_response(tmp_path) -> None:
+    responses = tmp_path / "responses"
+    responses.mkdir()
+    (responses / "step-001.model-ui-candidates.json").write_text(
+        json.dumps(
+            {
+                "candidates": [
+                    {"candidate_id": "model", "text": "다음", "click_point": [100, 200], "reason_tags": ["installer_dialog_control"]}
+                ]
+            },
+            ensure_ascii=False,
+        ),
+        encoding="utf-8",
+    )
+    (responses / "step-000.installer-ui-candidates.json").write_text(
+        json.dumps(
+            {
+                "candidates": [
+                    {"candidate_id": "installer", "text": "동의", "click_point": [300, 400], "reason_tags": ["installer_dialog_control"], "score": 80}
+                ]
+            },
+            ensure_ascii=False,
+        ),
+        encoding="utf-8",
+    )
+
+    candidates = _latest_model_ui_candidates_from_agent_run(str(tmp_path))
+
+    assert candidates == [
+        {
+            "candidate_id": "installer",
+            "text": "동의",
+            "click_point": [300, 400],
+            "bbox": None,
+            "reason_tags": ["installer_dialog_control"],
+            "score": 80,
+        }
+    ]
+
+
+def test_teacher_visible_click_candidate_from_result_uses_input_candidate() -> None:
+    candidates = [
+        {"candidate_id": "next", "text": "다음", "click_point": [1000, 700]},
+        {"candidate_id": "agree", "text": "동의", "click_point": [860, 640]},
+    ]
+
+    selected = _teacher_visible_click_candidate_from_result(
+        '{"actions":[{"action":"click","point":[860,640],"text":"동의"}]}',
+        candidates=candidates,
+    )
+
+    assert selected == {
+        "action": "click",
+        "candidate_id": "agree",
+        "point": [860, 640],
+        "text": "동의",
+        "reason": "",
+    }
+    normalized = json.dumps({"actions": [selected]}, ensure_ascii=False)
+    assert _teacher_visible_click_from_result(normalized)["point"] == [860, 640]
 
 
 def test_compose_chunk_prompt_includes_explicit_open_targets() -> None:
@@ -280,31 +374,6 @@ def test_extract_http_urls_handles_markdown_inline_link_without_merging_urls() -
     urls = _extract_http_urls("브라우저로 [`https://mydev.kr/`](https://mydev.kr/) 접속", limit=10)
 
     assert urls == ["https://mydev.kr/"]
-
-
-def test_extract_verified_installer_paths_skips_keyword_mismatched_marker() -> None:
-    result = {
-        "passed": True,
-        "evidence": [
-            {
-                "kind": "json_marker_valid_installer",
-                "passed": True,
-                "resolved_path": r"C:\Users\qkqxl\Downloads\DeskRest_n.exe",
-                "keywords": ["filezilla"],
-                "keyword_hits": [],
-                "marker_keyword_hits": ["filezilla"],
-            },
-            {
-                "kind": "json_marker_valid_installer",
-                "passed": True,
-                "resolved_path": r"C:\Users\qkqxl\Downloads\FileZilla_Setup.exe",
-                "keywords": ["filezilla"],
-                "keyword_hits": ["filezilla"],
-            },
-        ],
-    }
-
-    assert _extract_verified_installer_paths(result) == [r"C:\Users\qkqxl\Downloads\FileZilla_Setup.exe"]
 
 
 def test_expanded_glob_patterns_adds_aliases_for_windows_wildcard_suffix() -> None:
