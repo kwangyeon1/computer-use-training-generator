@@ -32,6 +32,7 @@ from computer_use_training_generator.cli import (
     _attach_source_task_prompt_key,
     _collect_retry_link_request_exclusions,
     _compose_chunk_prompt,
+    _compose_teacher_prompt,
     _compose_retry_prompt,
     _extract_http_urls,
     _extract_retry_exclusion_urls_and_queries,
@@ -67,6 +68,39 @@ def test_extract_link_candidate_urls_keeps_product_specific_pages() -> None:
     assert "https://filezilla-project.org/download.php?type=client" in urls
     assert "https://filezilla.kr/download" in urls
     assert all("google." not in url and "youtube." not in url for url in urls)
+
+
+def test_compose_teacher_prompt_requests_target_terms_marker() -> None:
+    prompt = _compose_teacher_prompt(task="고클린 설치해줘", config={"execution_style": "gui_first"})
+
+    assert "++TARGET_TERMS++: term1,term2" in prompt
+    assert "product names and aliases only" in prompt
+
+
+def test_normalize_chunks_preserves_teacher_target_terms_marker() -> None:
+    chunks = _normalize_chunks(
+        {
+            "chunks": [
+                {
+                    "chunk_id": "chunk-001",
+                    "title": "Download installer",
+                    "agent_prompt": "Download the Windows installer.",
+                    "success_hint": "installer exists",
+                    "preconditions": [],
+                    "verification": {"checks": [{"kind": "json_marker_valid_installer"}]},
+                    "max_retries": 1,
+                    "on_fail": "retry_current_chunk",
+                }
+            ]
+        },
+        source_task="고클린 설치해줘",
+        source_text="Plan the install.\n++TARGET_TERMS++: 고클린,GoClean",
+        execution_style="gui_first",
+    )
+
+    assert "++TARGET_TERMS++: 고클린,GoClean" in chunks[0].agent_prompt
+    marker_check = next(check for check in chunks[0].verification["checks"] if check["kind"] == "json_marker_valid_installer")
+    assert marker_check["keywords"] == ["고클린", "goclean"]
 
 
 def test_compose_retry_prompt_includes_teacher_candidate_urls() -> None:
@@ -1349,7 +1383,7 @@ def test_build_local_teacher_fallback_for_korean_task_uses_real_app_token() -> N
     assert "카카오톡" in marker_check["keywords"]
 
 
-def test_build_local_teacher_fallback_adds_ascii_alias_keywords_from_prompt_context() -> None:
+def test_build_local_teacher_fallback_uses_explicit_filename_terms_from_task() -> None:
     _, teacher_plan = build_local_teacher_fallback(
         task="setup_memoit193.exe를 내려받아 메모잇 프로그램을 설치해줘",
         prompt="dummy prompt",

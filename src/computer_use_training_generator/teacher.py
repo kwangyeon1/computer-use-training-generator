@@ -13,6 +13,9 @@ from .models import CommandResult, TeacherChunkPlanResult, TeacherResult, Teache
 from .subprocess_utils import render_command_template, run_command
 
 
+_TARGET_TERMS_MARKER = "++TARGET_TERMS++:"
+
+
 _SPLIT_PROMPT_TEMPLATE = """You are preparing executable GUI task chunks for a computer-use agent.
 
 Split the following overall task and teacher answer into a short ordered JSON plan.
@@ -64,6 +67,7 @@ Requirements:
 - Do not add commentary outside JSON.
 - Plan for the target machine described by the task and teacher answer, not for your own CLI sandbox.
 - If the task is about a Windows desktop or Windows software install, use Windows-oriented chunk prompts and Windows-friendly verifier checks.
+- If the teacher answer contains a `++TARGET_TERMS++:` line, preserve that exact line at the end of every software download/install/launch chunk `agent_prompt`.
 - For Windows software installation tasks, prefer the official `.exe` or `.msi` installer build, not `.zip`, portable, or archive downloads unless the task explicitly asks for those formats.
 - For Windows installer download chunks, state explicitly in `agent_prompt` that the agent must download the installer `.exe` or `.msi` and must avoid `.zip` or archive builds.
 - For Windows installer download chunks, prefer deterministic Python-first flows where there is grounded evidence: user-provided URL, current visible page, search result page, or a verified link discovered by the agent. Avoid guessed exact domains in the teacher chunk.
@@ -144,6 +148,43 @@ Requirements:
 - Return exactly one action when a useful visible control exists.
 - If no useful candidate exists, return {{"actions":[]}}.
 """
+
+
+def _target_terms_marker_line(text: str | None) -> str:
+    for line in str(text or "").splitlines():
+        if _TARGET_TERMS_MARKER not in line:
+            continue
+        _, raw_values = line.split(_TARGET_TERMS_MARKER, 1)
+        values = [value.strip() for value in re.split(r"[,，]", raw_values) if value.strip()]
+        if values:
+            return f"{_TARGET_TERMS_MARKER} {','.join(values)}"
+    return ""
+
+
+def _target_terms_marker_values(text: str | None, *, limit: int = 6) -> list[str]:
+    marker_line = _target_terms_marker_line(text)
+    if not marker_line:
+        return []
+    _, raw_values = marker_line.split(_TARGET_TERMS_MARKER, 1)
+    result: list[str] = []
+    for raw in re.split(r"[,，]", raw_values):
+        cleaned = str(raw or "").strip().lower().strip("`'\"[](){}")
+        if cleaned and cleaned not in result:
+            result.append(cleaned)
+        if len(result) >= limit:
+            break
+    return result
+
+
+def _append_target_terms_marker(prompt: str, marker_line: str) -> str:
+    normalized = str(prompt or "").strip()
+    marker_line = str(marker_line or "").strip()
+    if not normalized or not marker_line:
+        return normalized
+    if _TARGET_TERMS_MARKER in normalized:
+        return normalized
+    return f"{normalized}\n\n{marker_line}"
+
 
 _GENERIC_INSTALLER_TOKENS = {
     "downloads",
@@ -911,28 +952,6 @@ def _extract_urls_from_text(text: str) -> list[str]:
         if candidate and candidate not in urls:
             urls.append(candidate)
     return urls
-
-
-def _verification_alias_keywords(*texts: str, limit: int = 6) -> list[str]:
-    alias_seed_parts: list[str] = []
-    for text in texts:
-        raw_text = str(text or "")
-        if not raw_text:
-            continue
-        for url in _extract_urls_from_text(raw_text):
-            keyword_text = _url_keyword_text(url)
-            if keyword_text:
-                alias_seed_parts.append(keyword_text)
-        for filename in re.findall(r"[A-Za-z0-9][A-Za-z0-9._-]{2,}\.(?:exe|msi|zip|alz)", raw_text, flags=re.IGNORECASE):
-            alias_seed_parts.append(Path(filename).stem)
-    aliases: list[str] = []
-    for token in _target_installer_keywords(*alias_seed_parts, limit=max(limit * 2, 8)):
-        if re.search(r"[a-z]", token) is None or token in aliases:
-            continue
-        aliases.append(token)
-        if len(aliases) >= limit:
-            break
-    return aliases
 
 
 def _remove_non_user_urls_from_prompt(source_task: str, text: str) -> str:
@@ -1737,27 +1756,11 @@ def _local_install_chunks(
     )
     target_keywords: list[str] = []
     task_keywords = _target_installer_keywords(task, limit=6)
-    alias_keywords = _verification_alias_keywords(
-        task,
-        keyword_download_glob or "",
-        download_prompt,
-        install_prompt,
-        launch_prompt,
-        discovered_source_hint,
-        limit=6,
-    )
     for token in task_keywords:
         if token not in target_keywords:
             target_keywords.append(token)
-    task_has_ascii_keyword = any(re.search(r"[a-z]", token) for token in target_keywords)
-    if not task_has_ascii_keyword:
-        for token in alias_keywords:
-            if token not in target_keywords:
-                target_keywords.append(token)
-            if len(target_keywords) >= 6:
-                break
     if not target_keywords:
-        target_keywords = alias_keywords[:6]
+        target_keywords = _target_installer_keywords(keyword_download_glob or "", limit=6)
     if normalized_style == "gui_first":
         download_verification_checks = [
             {
@@ -2212,6 +2215,7 @@ def _normalize_chunks(
     execution_style: str = "python_first",
 ) -> list[TeacherTaskChunk]:
     normalized_style = _normalize_execution_style(execution_style)
+    target_terms_marker = _target_terms_marker_line(source_text)
     raw_chunks = payload.get("chunks")
     if not isinstance(raw_chunks, list):
         raise RuntimeError("teacher split output did not contain a chunks list")
@@ -2236,6 +2240,8 @@ def _normalize_chunks(
             agent_prompt=agent_prompt,
             execution_style=normalized_style,
         )
+        if _looks_like_install_task(source_task):
+            agent_prompt = _append_target_terms_marker(agent_prompt, target_terms_marker)
         success_hint = str(item.get("success_hint") or "").strip() or None
         preconditions = [str(value).strip() for value in item.get("preconditions", []) if str(value).strip()] if isinstance(item.get("preconditions"), list) else []
         raw_verification = item.get("verification")
@@ -2245,16 +2251,17 @@ def _normalize_chunks(
             agent_prompt=agent_prompt,
             verification=verification,
         )
-        target_keywords = _target_installer_keywords(source_task, title, agent_prompt, limit=6)
-        source_target_keywords = _target_installer_keywords(source_task, limit=6)
-        if not any(re.search(r"[a-z]", token) for token in source_target_keywords):
-            for token in _verification_alias_keywords(source_task, source_text, agent_prompt, limit=6):
-                if token not in source_target_keywords:
-                    source_target_keywords.append(token)
-                if len(source_target_keywords) >= 6:
-                    break
+        marker_target_keywords = _target_terms_marker_values(source_text, limit=6)
+        target_keywords = marker_target_keywords or _target_installer_keywords(source_task, title, agent_prompt, limit=6)
+        source_target_keywords = marker_target_keywords or _target_installer_keywords(source_task, limit=6)
         if not source_target_keywords:
             source_target_keywords = target_keywords
+        if verification and source_target_keywords:
+            for check in verification.get("checks", []) if isinstance(verification.get("checks"), list) else []:
+                if not isinstance(check, dict):
+                    continue
+                if check.get("kind") in {"json_marker_valid_installer", "json_marker_valid_exe"} and not check.get("keywords"):
+                    check["keywords"] = source_target_keywords
         if _looks_like_install_task(source_task):
             is_download_stage = _looks_like_download_chunk(title, agent_prompt)
             combined_stage = f"{title}\n{agent_prompt}".lower()
