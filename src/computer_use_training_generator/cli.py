@@ -858,9 +858,15 @@ def _should_stop_after_install_completion(task: str, chunk: TeacherTaskChunk) ->
 def _compose_teacher_prompt(*, task: str, config: dict) -> str:
     context = str(config.get("teacher_task_context") or "").strip()
     style_context = _teacher_execution_style_context(str(config.get("execution_style") or "python_first"))
+    target_terms_contract = (
+        "At the very end of your answer, add exactly one machine-readable target-term line:\n"
+        "++TARGET_TERMS++: term1,term2\n"
+        "Use product names and aliases only. Include the original product name and common Latin/English alias if known. "
+        "Do not include workflow words such as install, installer, setup, handle, python, gui, windows, next, finish, download, default, or success."
+    )
     if not context:
-        return f"{style_context}\n\nActual task for the target machine:\n{task.strip()}"
-    return f"{context}\n\n{style_context}\n\nActual task for the target machine:\n{task.strip()}"
+        return f"{style_context}\n\n{target_terms_contract}\n\nActual task for the target machine:\n{task.strip()}"
+    return f"{context}\n\n{style_context}\n\n{target_terms_contract}\n\nActual task for the target machine:\n{task.strip()}"
 
 
 def _request_terminal_attention(message: str) -> None:
